@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""emusetup (Linux): install Azahar (3DS emulator) and keep your saves backed up.
+"""3ds-setup (Linux): install Azahar (3DS emulator) and keep your saves backed up.
 
 Commands:
   install   download/update Azahar, pick a backup folder, start the background watcher
@@ -24,14 +24,14 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-APP = "emusetup"
+APP = "3ds-setup"
 RELEASE_API = "https://api.github.com/repos/azahar-emu/azahar/releases/latest"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
 INSTALL_DIR = XDG_DATA / APP
 CONFIG_PATH = XDG_CONFIG / APP / "config.json"
-LOG_PATH = INSTALL_DIR / "emusetup.log"
+LOG_PATH = INSTALL_DIR / "3ds-setup.log"
 LOCK_PATH = INSTALL_DIR / "watch.lock"
 APPIMAGE = INSTALL_DIR / "azahar.AppImage"
 VERSION_FILE = INSTALL_DIR / "azahar-version.txt"
@@ -39,7 +39,7 @@ VERSION_FILE = INSTALL_DIR / "azahar-version.txt"
 FALLBACK_DIR = INSTALL_DIR / "pending-backups"
 
 DEFAULTS = {
-    "backup_dir": str(HOME / "EmuBackups"),
+    "backup_dir": str(HOME / "3DS-Backups"),
     "backup_every_minutes": 5,
     "autosave_state_every_minutes": 10,  # 0 turns auto save-states off
     "autosave_hotkey": "ctrl+c",  # Azahar default for "Save to Oldest Non-Quicksave Slot"
@@ -383,12 +383,12 @@ def cmd_restore(args):
             with zipfile.ZipFile(s) as z:
                 titles = sorted({t for t in map(title_of, z.namelist()) if t})
             print(f"{i:3}  {s.stem}   games: {', '.join(titles) or '-'}")
-        print("\nrestore with:  emusetup restore <number> [--game TITLEID]")
+        print("\nrestore with:  3ds-setup restore <number> [--game TITLEID]")
         return
 
     if args.snapshot.isdigit():
         if not 1 <= int(args.snapshot) <= len(snaps):
-            sys.exit(f"pick a number from 1 to {len(snaps)} (run 'emusetup restore' to list)")
+            sys.exit(f"pick a number from 1 to {len(snaps)} (run '3ds-setup restore' to list)")
         snap = snaps[int(args.snapshot) - 1]
     else:
         snap = Path(args.snapshot)
@@ -476,11 +476,11 @@ def cmd_install(args):
 
     tag = download_azahar()
 
-    me = INSTALL_DIR / "emusetup.py"
+    me = INSTALL_DIR / "3ds-setup.py"
     if Path(__file__).resolve() != me.resolve():
         shutil.copy2(__file__, me)
     me.chmod(0o755)
-    bin_link = HOME / ".local/bin/emusetup"
+    bin_link = HOME / ".local/bin/3ds-setup"
     bin_link.parent.mkdir(parents=True, exist_ok=True)
     if bin_link.is_symlink() or bin_link.exists():
         bin_link.unlink()
@@ -488,14 +488,14 @@ def cmd_install(args):
 
     apps = XDG_DATA / "applications"
     apps.mkdir(parents=True, exist_ok=True)
-    (apps / "azahar-emusetup.desktop").write_text(
+    (apps / "azahar-3ds-setup.desktop").write_text(
         "[Desktop Entry]\nType=Application\nName=Azahar (3DS)\n"
         f"Exec={APPIMAGE} %f\nTerminal=false\nCategories=Game;Emulator;\n"
         "MimeType=application/x-ctr-3dsx;application/x-ctr-cci;application/x-ctr-cia;"
         "application/x-ctr-cxi;\n")
     autostart = XDG_CONFIG / "autostart"
     autostart.mkdir(parents=True, exist_ok=True)
-    (autostart / "emusetup-watch.desktop").write_text(
+    (autostart / "3ds-setup-watch.desktop").write_text(
         "[Desktop Entry]\nType=Application\nName=3DS save backups\n"
         f"Exec={sys.executable} {me} watch\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n")
 
@@ -520,7 +520,7 @@ def cmd_status(args):
         os.kill(pid, 0)
         watcher = f"running (pid {pid})"
     except (OSError, ValueError):
-        watcher = "NOT running  (start it: emusetup watch &)"
+        watcher = "NOT running  (start it: 3ds-setup watch &)"
     version = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "not installed"
     print(f"Azahar:        {version}  {APPIMAGE}")
     print(f"Azahar data:   {data_dir}")

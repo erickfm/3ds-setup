@@ -32,17 +32,17 @@ The backup watcher starts with Windows on its own. You don't need to do anything
 
 ```sh
 ./linux/install.sh                                   # asks where backups go
-./linux/install.sh --backup-dir /media/$USER/MyDrive/EmuBackups
+./linux/install.sh --backup-dir /media/$USER/MyDrive/3DS-Backups
 ```
 
-This adds **Azahar (3DS)** to your app menu and an `emusetup` command (in `~/.local/bin`). The watcher also starts on login.
+This adds **Azahar (3DS)** to your app menu and an `3ds-setup` command (in `~/.local/bin`). The watcher also starts on login.
 
 ```sh
-emusetup status          # is the watcher running, where do backups go
-emusetup backup          # back up now
-emusetup restore         # list snapshots
-emusetup restore 3 --game 00055D00   # restore snapshot #3, only that game
-emusetup install         # update Azahar
+3ds-setup status          # is the watcher running, where do backups go
+3ds-setup backup          # back up now
+3ds-setup restore         # list snapshots
+3ds-setup restore 3 --game 00055D00   # restore snapshot #3, only that game
+3ds-setup install         # update Azahar
 ```
 
 For auto save-states you need X11 and `xdotool`. On Wayland, save backups still work, but auto save-states are skipped.
@@ -75,11 +75,11 @@ To use a backed-up save state: copy it into Azahar's `states` folder and rename 
 
 ## Settings
 
-The config file lives at `%APPDATA%\emusetup\config.json` on Windows and `~/.config/emusetup/config.json` on Linux. The watcher picks up changes without a restart.
+The config file lives at `%APPDATA%\3ds-setup\config.json` on Windows and `~/.config/3ds-setup/config.json` on Linux. The watcher picks up changes without a restart.
 
 ```json
 {
-  "backup_dir": "D:\\EmuBackups",
+  "backup_dir": "D:\\3DS-Backups",
   "backup_every_minutes": 5,
   "autosave_state_every_minutes": 10,
   "autosave_hotkey": "ctrl+c",

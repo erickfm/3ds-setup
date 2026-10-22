@@ -1,5 +1,5 @@
 <#
-emusetup (Windows): install Azahar (3DS emulator) and keep your saves backed up.
+3ds-setup (Windows): install Azahar (3DS emulator) and keep your saves backed up.
 
   install   download/update Azahar, pick a backup folder, start the background watcher
   watch     background loop: while Azahar runs, back up saves and auto save-state
@@ -21,21 +21,21 @@ $ProgressPreference = 'SilentlyContinue'  # Invoke-WebRequest is very slow with 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 
-$App = 'emusetup'
+$App = '3ds-setup'
 $ReleaseApi = 'https://api.github.com/repos/azahar-emu/azahar/releases/latest'
 $InstallDir = "$env:LOCALAPPDATA\$App"
 $AzaharDir = "$env:LOCALAPPDATA\Programs\Azahar"
 $AzaharExe = "$AzaharDir\azahar.exe"
-$VersionFile = "$AzaharDir\emusetup-version.txt"
+$VersionFile = "$AzaharDir\3ds-setup-version.txt"
 $ConfigPath = "$env:APPDATA\$App\config.json"
-$LogPath = "$InstallDir\emusetup.log"
+$LogPath = "$InstallDir\3ds-setup.log"
 # Used when the backup folder is missing (e.g. external drive unplugged); moved over once it's back.
 $FallbackDir = "$InstallDir\pending-backups"
 $Host_ = $env:COMPUTERNAME
 $TickSeconds = 15
 
 $Defaults = [ordered]@{
-    backup_dir                   = "$env:USERPROFILE\EmuBackups"
+    backup_dir                   = "$env:USERPROFILE\3DS-Backups"
     backup_every_minutes         = 5
     autosave_state_every_minutes = 10       # 0 turns auto save-states off
     autosave_hotkey              = 'ctrl+c' # Azahar default for "Save to Oldest Non-Quicksave Slot"
@@ -337,7 +337,7 @@ function Invoke-Autosave($cfg) {
 # ---------------------------------------------------------------- commands
 
 function Invoke-Watch {
-    $mutex = New-Object Threading.Mutex($false, 'Local\emusetup-watch')
+    $mutex = New-Object Threading.Mutex($false, 'Local\3ds-setup-watch')
     if (-not $mutex.WaitOne(0)) { Write-Host 'watcher already running'; return }
     Log 'watcher started'
     $wasRunning = $false
@@ -501,7 +501,7 @@ function Select-BackupFolder($default) {
         $dlg.Description = 'Where should 3DS save backups go? (external drive or OneDrive/Dropbox folder)'
         $dlg.ShowNewFolderButton = $true
         $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
-        if ($dlg.ShowDialog($owner) -eq 'OK') { return (Join-Path $dlg.SelectedPath 'EmuBackups') }
+        if ($dlg.ShowDialog($owner) -eq 'OK') { return (Join-Path $dlg.SelectedPath '3DS-Backups') }
     } catch {}
     $answer = Read-Host "Backup folder [$default]"
     if ($answer) { return $answer }
@@ -520,7 +520,7 @@ function New-Shortcut($path, $target, $arguments, $workdir, [int]$window = 1) {
 
 function Stop-Watcher {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*emusetup.ps1*watch*' } |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*3ds-setup.ps1*watch*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
@@ -536,7 +536,7 @@ function Invoke-Install {
     $tag = Install-Azahar
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    $me = Join-Path $InstallDir 'emusetup.ps1'
+    $me = Join-Path $InstallDir '3ds-setup.ps1'
     if ($PSCommandPath -ne $me) { Copy-Item -LiteralPath $PSCommandPath -Destination $me -Force }
     Unblock-File -LiteralPath $me
 
@@ -566,7 +566,7 @@ function Show-Status {
     $cfg = Get-Config
     $root = Get-BackupRoot $cfg
     $snaps = Get-Snapshots $cfg
-    $watcher = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*emusetup.ps1*watch*' })
+    $watcher = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*3ds-setup.ps1*watch*' })
     $version = if (Test-Path -LiteralPath $VersionFile) { (Get-Content -LiteralPath $VersionFile -Raw).Trim() } else { 'not installed' }
     Write-Host "Azahar:       $version  $AzaharExe"
     Write-Host "Azahar data:  $(Get-AzaharUserDir)"
@@ -586,7 +586,7 @@ try {
         'backup'  { Invoke-Backup }
         'restore' { Invoke-Restore }
         'status'  { Show-Status }
-        default   { Write-Host 'usage: emusetup.ps1 install|watch|backup|restore|status' }
+        default   { Write-Host 'usage: 3ds-setup.ps1 install|watch|backup|restore|status' }
     }
 } catch {
     Write-Host "ERROR: $_" -ForegroundColor Red

@@ -1,6 +1,6 @@
-# emusetup
+# 3ds-setup
 
-One-step setup for [Azahar](https://azahar-emu.org) (the 3DS emulator that replaced Citra), plus a background watcher that makes sure you never lose a save.
+One-step 3DS setup: installs [Azahar](https://azahar-emu.org) (the emulator that replaced Citra), plus a background watcher that makes sure you never lose a save.
 
 - **Downloads and installs Azahar** (latest release from its GitHub, checksum-verified). Re-run it any time to update.
 - **Backs up your in-game saves** every 5 minutes while Azahar is open, plus when it starts and closes. Each backup is a dated `.zip` snapshot, made only when something actually changed.

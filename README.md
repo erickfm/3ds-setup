@@ -1,6 +1,6 @@
 # 3ds-setup
 
-One-step 3DS setup: installs [Azahar](https://azahar-emu.org) (the emulator that replaced Citra), plus a background watcher that makes sure you never lose a save.
+One-step 3DS setup for **Windows, macOS and Linux**: installs [Azahar](https://azahar-emu.org) (the emulator that replaced Citra), plus a background watcher that makes sure you never lose a save.
 
 - **Downloads and installs Azahar** (latest release from its GitHub, checksum-verified). Re-run it any time to update.
 - **Backs up your in-game saves** every 5 minutes while Azahar is open, plus when it starts and closes. Each backup is a dated `.zip` snapshot, made only when something actually changed.
@@ -28,14 +28,31 @@ One-step 3DS setup: installs [Azahar](https://azahar-emu.org) (the emulator that
 
 The backup watcher starts with Windows on its own. You don't need to do anything.
 
+## macOS
+
+1. Download this repo (green **Code** button → **Download ZIP**). It unzips itself in Downloads.
+2. Open the `mac-linux` folder, **right-click `Install.command` → Open**, then click **Open** again.
+   A plain double-click gets blocked because the script isn't from the App Store.
+   - If a window offers to install "Command Line Tools", click **Install**. Once it's done, open `Install.command` again. This is a one-time step that gives macOS the Python the script uses.
+   - A folder picker asks where backups should go. Pick an external drive or an iCloud/Dropbox folder.
+3. Done. **Azahar** is now in your Applications folder (and in Launchpad), and the backup watcher starts every time you log in.
+
+Notes:
+- macOS shows "Background Items Added" for the watcher. That's expected.
+- For auto save-states, macOS asks once whether `python3` may control System Events and use **Accessibility**. Allow both: the second one is under System Settings → Privacy & Security → Accessibility. If you skip this, save backups still work.
+- If backups go to an external drive or iCloud folder, macOS might ask whether `python3` may access it. Click **Allow**.
+- On a Mac the autosave hotkey is **⌘C** and loading the newest one is **⌘V**: Azahar turns "Ctrl" shortcuts into ⌘.
+
+Commands work the same as on Linux (below), using `~/.local/bin/3ds-setup`.
+
 ## Linux
 
 ```sh
-./linux/install.sh                                   # asks where backups go
-./linux/install.sh --backup-dir /media/$USER/MyDrive/3DS-Backups
+./mac-linux/install.sh                                   # asks where backups go
+./mac-linux/install.sh --backup-dir /media/$USER/MyDrive/3DS-Backups
 ```
 
-This adds **Azahar (3DS)** to your app menu and an `3ds-setup` command (in `~/.local/bin`). The watcher also starts on login.
+This adds **Azahar (3DS)** to your app menu and a `3ds-setup` command (in `~/.local/bin`). The watcher also starts on login.
 
 ```sh
 3ds-setup status          # is the watcher running, where do backups go
@@ -75,7 +92,7 @@ To use a backed-up save state: copy it into Azahar's `states` folder and rename 
 
 ## Settings
 
-The config file lives at `%APPDATA%\3ds-setup\config.json` on Windows and `~/.config/3ds-setup/config.json` on Linux. The watcher picks up changes without a restart.
+The config file lives at `%APPDATA%\3ds-setup\config.json` on Windows, `~/Library/Application Support/3ds-setup/config.json` on macOS, and `~/.config/3ds-setup/config.json` on Linux. The watcher picks up changes without a restart.
 
 ```json
 {

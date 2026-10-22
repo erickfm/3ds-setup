@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3ds-setup (Linux): install Azahar (3DS emulator) and keep your saves backed up.
+"""3ds-setup (Linux + macOS): install Azahar (3DS emulator) and keep your saves backed up.
 
 Commands:
   install   download/update Azahar, pick a backup folder, start the background watcher
@@ -14,6 +14,8 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
+import re
 import shutil
 import signal
 import socket
@@ -29,11 +31,20 @@ RELEASE_API = "https://api.github.com/repos/azahar-emu/azahar/releases/latest"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
-INSTALL_DIR = XDG_DATA / APP
-CONFIG_PATH = XDG_CONFIG / APP / "config.json"
+IS_MAC = sys.platform == "darwin"
+if IS_MAC:
+    INSTALL_DIR = HOME / "Library/Application Support" / APP
+    CONFIG_PATH = INSTALL_DIR / "config.json"
+else:
+    INSTALL_DIR = XDG_DATA / APP
+    CONFIG_PATH = XDG_CONFIG / APP / "config.json"
 LOG_PATH = INSTALL_DIR / "3ds-setup.log"
 LOCK_PATH = INSTALL_DIR / "watch.lock"
 APPIMAGE = INSTALL_DIR / "azahar.AppImage"
+MAC_APP = HOME / "Applications/Azahar.app"
+AZAHAR_PATH = MAC_APP if IS_MAC else APPIMAGE
+LAUNCH_AGENT_LABEL = "io.github.erickfm.3ds-setup"
+LAUNCH_AGENT = HOME / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 VERSION_FILE = INSTALL_DIR / "azahar-version.txt"
 # Used when the backup folder is missing (e.g. external drive unplugged); moved over once it's back.
 FALLBACK_DIR = INSTALL_DIR / "pending-backups"
@@ -64,7 +75,12 @@ def log(msg):
 
 
 def notify(msg):
-    if shutil.which("notify-send"):
+    if IS_MAC:
+        subprocess.run(["osascript", "-e", "on run argv", "-e",
+                        'display notification (item 1 of argv) with title "3DS backups"',
+                        "-e", "end run", msg],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif shutil.which("notify-send"):
         subprocess.run(["notify-send", "-a", "3DS backups", "3DS backups", msg],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -83,6 +99,12 @@ def save_config(cfg):
 
 def azahar_dirs():
     """(data_dir, config_dir) Azahar is using: Flatpak if present, otherwise the normal XDG dirs."""
+    if IS_MAC:
+        # Same rule as Azahar: XDG dirs if an older setup created them, else Application Support.
+        if (XDG_DATA / "azahar-emu").exists() or (XDG_CONFIG / "azahar-emu").exists():
+            return XDG_DATA / "azahar-emu", XDG_CONFIG / "azahar-emu"
+        data = HOME / "Library/Application Support/Azahar"
+        return data, data / "config"
     flatpak = HOME / ".var/app/org.azahar_emu.Azahar"
     if (flatpak / "data/azahar-emu").is_dir():
         return flatpak / "data/azahar-emu", flatpak / "config/azahar-emu"
@@ -90,6 +112,9 @@ def azahar_dirs():
 
 
 def azahar_running():
+    if IS_MAC:
+        out = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True).stdout
+        return any(os.path.basename(line.strip()) == "azahar" for line in out.splitlines())
     # Match on the executable, not just the process name: inside the AppImage the
     # emulator runs as "AppRun.wrapped" with exe .../bin/azahar.
     for proc in Path("/proc").glob("[0-9]*"):
@@ -289,22 +314,67 @@ def backup_all(cfg, reason):
 _autosave_unavailable_logged = False
 
 
+def autosave_unavailable(why):
+    global _autosave_unavailable_logged
+    if not _autosave_unavailable_logged:
+        log(f"auto save-state unavailable: {why}; skipping (save backups still run)")
+        _autosave_unavailable_logged = True
+    return None
+
+
+def focused_title():
+    """Title of the focused window, or None if we can't find out on this system."""
+    if IS_MAC:
+        r = subprocess.run(["osascript", "-e", MAC_FRONT_WINDOW], capture_output=True, text=True)
+        if r.returncode != 0:
+            return autosave_unavailable(
+                "allow Accessibility for python3 in System Settings > Privacy & Security")
+        return r.stdout.strip()
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland" or not shutil.which("xdotool"):
+        return autosave_unavailable("needs X11 + xdotool")
+    r = subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+MAC_FRONT_WINDOW = """
+tell application "System Events"
+    set p to first application process whose frontmost is true
+    if (count of windows of p) is 0 then return ""
+    return name of front window of p
+end tell"""
+
+# Qt shortcuts on macOS: "Ctrl" is the Command key and "Meta" is Control.
+MAC_MODIFIERS = {"ctrl": "command down", "control": "command down", "meta": "control down",
+                 "shift": "shift down", "alt": "option down"}
+MAC_FKEYS = {"f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98,
+             "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111}
+
+
+def press_hotkey(hotkey):
+    if not IS_MAC:
+        subprocess.run(["xdotool", "key", "--clearmodifiers", hotkey])
+        return
+    *mods, key = hotkey.lower().split("+")
+    if key in MAC_FKEYS:
+        action = f"key code {MAC_FKEYS[key]}"
+    elif re.fullmatch(r"[a-z0-9]", key):
+        action = f'keystroke "{key}"'
+    else:
+        raise ValueError(f"can't understand hotkey {hotkey!r}")
+    using = ", ".join(MAC_MODIFIERS[m] for m in mods)
+    script = f'tell application "System Events" to {action}' + (f" using {{{using}}}" if using else "")
+    subprocess.run(["osascript", "-e", script], check=True)
+
+
 def try_autosave(cfg):
     """Press Azahar's save-state hotkey, but only while an Azahar game window is focused.
     Returns True if the key was sent."""
-    global _autosave_unavailable_logged
-    if os.environ.get("XDG_SESSION_TYPE") == "wayland" or not shutil.which("xdotool"):
-        if not _autosave_unavailable_logged:
-            log("auto save-state needs X11 + xdotool; skipping (save backups still run)")
-            _autosave_unavailable_logged = True
-        return False
-    r = subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
-                       capture_output=True, text=True)
-    title = r.stdout.strip()
+    title = focused_title()
     # Azahar's title is "Azahar <version> | <game>" only while a game is loaded.
-    if not (title.startswith("Azahar ") and " | " in title):
+    if not (title and title.startswith("Azahar ") and " | " in title):
         return False
-    subprocess.run(["xdotool", "key", "--clearmodifiers", cfg["autosave_hotkey"]])
+    press_hotkey(cfg["autosave_hotkey"])
     log(f"auto save-state ({title})")
     return True
 
@@ -403,7 +473,7 @@ def cmd_restore(args):
             if not names:
                 sys.exit(f"{snap.name} has no save for {game}")
 
-        print(f"backing up current saves first (so this can be undone)...")
+        print("backing up current saves first (so this can be undone)...")
         before = backup_saves(cfg, force=True, prune=False)  # don't prune what we're restoring
 
         data_dir, _ = azahar_dirs()
@@ -425,14 +495,20 @@ def download_azahar(update=True):
     req = urllib.request.Request(RELEASE_API, headers={"User-Agent": APP})
     release = json.load(urllib.request.urlopen(req, timeout=30))
     tag = release["tag_name"]
-    if APPIMAGE.exists() and VERSION_FILE.exists() and VERSION_FILE.read_text().strip() == tag:
+    if AZAHAR_PATH.exists() and VERSION_FILE.exists() and VERSION_FILE.read_text().strip() == tag:
         print(f"Azahar {tag} already installed")
         return tag
-    if APPIMAGE.exists() and not update:
+    if AZAHAR_PATH.exists() and not update:
         return VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "?"
-    asset = next(a for a in release["assets"] if a["name"] == "azahar.AppImage")
+    if IS_MAC:
+        if azahar_running():
+            sys.exit("close Azahar first so it can be updated")
+        asset = next(a for a in release["assets"]
+                     if a["name"].startswith("azahar-macos-universal-") and a["name"].endswith(".zip"))
+    else:
+        asset = next(a for a in release["assets"] if a["name"] == "azahar.AppImage")
     print(f"downloading Azahar {tag} ({asset['size'] // 2**20} MB)...")
-    tmp = APPIMAGE.with_name("azahar.AppImage.partial")
+    tmp = INSTALL_DIR / (asset["name"] + ".partial")
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": APP})
     with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
@@ -446,10 +522,64 @@ def download_azahar(update=True):
         if h.hexdigest() != expected:
             tmp.unlink()
             sys.exit("download checksum mismatch, aborting")
-    tmp.chmod(0o755)
-    os.replace(tmp, APPIMAGE)
+    if IS_MAC:
+        install_mac_app(tmp)
+    else:
+        tmp.chmod(0o755)
+        os.replace(tmp, APPIMAGE)
     VERSION_FILE.write_text(tag + "\n")
     return tag
+
+
+def install_mac_app(zip_path):
+    extract = INSTALL_DIR / "extract"
+    shutil.rmtree(extract, ignore_errors=True)
+    # ditto, not zipfile: it keeps the executable bits and the app's code signature intact.
+    subprocess.run(["ditto", "-x", "-k", str(zip_path), str(extract)], check=True)
+    app = next(extract.glob("**/Azahar.app"))
+    MAC_APP.parent.mkdir(exist_ok=True)
+    if MAC_APP.exists():
+        shutil.rmtree(MAC_APP)
+    shutil.move(str(app), str(MAC_APP))
+    subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(MAC_APP)], stderr=subprocess.DEVNULL)
+    shutil.rmtree(extract)
+    zip_path.unlink()
+
+
+def choose_backup_dir(default):
+    print("Where should backups go? Pick an external drive or a synced folder (Dropbox etc).")
+    if IS_MAC:
+        r = subprocess.run(["osascript", "-e", 'POSIX path of (choose folder with prompt '
+                            '"Where should 3DS save backups go? (external drive or a synced folder)")'],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return str(Path(r.stdout.strip()) / "3DS-Backups")
+    answer = input(f"Backup folder [{default}]: ").strip()
+    return answer or default
+
+
+def start_watcher_at_login(me):
+    if IS_MAC:
+        LAUNCH_AGENT.parent.mkdir(parents=True, exist_ok=True)
+        with open(LAUNCH_AGENT, "wb") as f:
+            plistlib.dump({"Label": LAUNCH_AGENT_LABEL,
+                           "ProgramArguments": [sys.executable, str(me), "watch"],
+                           "RunAtLoad": True,
+                           "StandardErrorPath": str(INSTALL_DIR / "watch-errors.log")}, f)
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCH_AGENT_LABEL}"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stop_watcher()
+        subprocess.run(["launchctl", "bootstrap", domain, str(LAUNCH_AGENT)], check=True)
+        return
+    autostart = XDG_CONFIG / "autostart"
+    autostart.mkdir(parents=True, exist_ok=True)
+    (autostart / "3ds-setup-watch.desktop").write_text(
+        "[Desktop Entry]\nType=Application\nName=3DS save backups\n"
+        f"Exec={sys.executable} {me} watch\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n")
+    stop_watcher()
+    subprocess.Popen([sys.executable, str(me), "watch"], start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def stop_watcher():
@@ -466,10 +596,7 @@ def cmd_install(args):
     if args.backup_dir:
         cfg["backup_dir"] = args.backup_dir
     elif not CONFIG_PATH.exists() and sys.stdin.isatty():
-        print("Where should backups go? Pick an external drive or a synced folder (Dropbox etc).")
-        answer = input(f"Backup folder [{cfg['backup_dir']}]: ").strip()
-        if answer:
-            cfg["backup_dir"] = answer
+        cfg["backup_dir"] = choose_backup_dir(cfg["backup_dir"])
     cfg["backup_dir"] = str(Path(cfg["backup_dir"]).expanduser().resolve())
     Path(cfg["backup_dir"]).mkdir(parents=True, exist_ok=True)
     save_config(cfg)
@@ -486,27 +613,25 @@ def cmd_install(args):
         bin_link.unlink()
     bin_link.symlink_to(me)
 
-    apps = XDG_DATA / "applications"
-    apps.mkdir(parents=True, exist_ok=True)
-    (apps / "azahar-3ds-setup.desktop").write_text(
-        "[Desktop Entry]\nType=Application\nName=Azahar (3DS)\n"
-        f"Exec={APPIMAGE} %f\nTerminal=false\nCategories=Game;Emulator;\n"
-        "MimeType=application/x-ctr-3dsx;application/x-ctr-cci;application/x-ctr-cia;"
-        "application/x-ctr-cxi;\n")
-    autostart = XDG_CONFIG / "autostart"
-    autostart.mkdir(parents=True, exist_ok=True)
-    (autostart / "3ds-setup-watch.desktop").write_text(
-        "[Desktop Entry]\nType=Application\nName=3DS save backups\n"
-        f"Exec={sys.executable} {me} watch\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n")
+    if not IS_MAC:
+        apps = XDG_DATA / "applications"
+        apps.mkdir(parents=True, exist_ok=True)
+        (apps / "azahar-3ds-setup.desktop").write_text(
+            "[Desktop Entry]\nType=Application\nName=Azahar (3DS)\n"
+            f"Exec={APPIMAGE} %f\nTerminal=false\nCategories=Game;Emulator;\n"
+            "MimeType=application/x-ctr-3dsx;application/x-ctr-cci;application/x-ctr-cia;"
+            "application/x-ctr-cxi;\n")
+    start_watcher_at_login(me)
 
-    stop_watcher()
-    subprocess.Popen([sys.executable, str(me), "watch"], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    print(f"\nAzahar {tag} installed: {APPIMAGE}  (menu: 'Azahar (3DS)')")
+    where = "in Applications / Launchpad" if IS_MAC else "menu: 'Azahar (3DS)'"
+    print(f"\nAzahar {tag} installed: {AZAHAR_PATH}  ({where})")
     print(f"Backups go to {cfg['backup_dir']}/{socket.gethostname()}/")
     print(f"Watcher running and set to start at login. Settings: {CONFIG_PATH}")
-    if not shutil.which("xdotool"):
+    print(f"Command: {bin_link}  (e.g. '{bin_link} status')")
+    if IS_MAC:
+        print("For auto save-states, macOS will ask to let python3 control your computer\n"
+              "(Accessibility). Allow it in System Settings > Privacy & Security > Accessibility.")
+    elif not shutil.which("xdotool"):
         print("Install xdotool for auto save-states:  sudo apt install xdotool")
 
 
@@ -522,7 +647,7 @@ def cmd_status(args):
     except (OSError, ValueError):
         watcher = "NOT running  (start it: 3ds-setup watch &)"
     version = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "not installed"
-    print(f"Azahar:        {version}  {APPIMAGE}")
+    print(f"Azahar:        {version}  {AZAHAR_PATH}")
     print(f"Azahar data:   {data_dir}")
     print(f"Backups:       {root}" + ("" if on_target else "   (backup folder missing! using local fallback)"))
     print(f"Snapshots:     {len(snaps)}" + (f", newest {snaps[0].stem}" if snaps else ""))

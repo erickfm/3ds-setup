@@ -18,11 +18,13 @@ import os
 import plistlib
 import re
 import shutil
+import platform
 import signal
 import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 import zipfile
@@ -54,6 +56,14 @@ LINUX_APPS = XDG_DATA / "applications"
 LINUX_AUTOSTART = XDG_CONFIG / "autostart" / "3ds-setup-watch.desktop"
 BIN_LINK = HOME / ".local/bin/3ds-setup"
 VERSION_FILE = INSTALL_DIR / "azahar-version.txt"
+HEARTBEAT = INSTALL_DIR / "watch.heartbeat"  # touched every tick so the 3DS app can tell we're running
+# The 3DS app (launcher/ in the repo). tools/build-release.py fills these in for each release.
+RELEASE_TAG = ""
+LAUNCHER = {}
+LAUNCHER_BIN = INSTALL_DIR / "3ds-launcher"
+LAUNCHER_ICON = INSTALL_DIR / "3ds.png"
+MAC_LAUNCHER = HOME / "Applications/3DS.app"
+LAUNCHER_ID = "io.github.erickfm.threeds"  # the app's identifier; its web view keeps data under it
 # Used when the backup folder is missing (e.g. external drive unplugged); moved over once it's back.
 FALLBACK_DIR = INSTALL_DIR / "pending-backups"
 
@@ -645,6 +655,10 @@ def cmd_watch(args):
     was_running = False
     last_backup = last_autosave = time.monotonic()
     while True:
+        try:
+            HEARTBEAT.touch()
+        except OSError:
+            pass
         cfg = load_config()  # pick up edits without a restart
         running = azahar_running()
         now = time.monotonic()
@@ -740,7 +754,8 @@ def cmd_restore(args):
         game = args.game.upper() if args.game else None
 
     if azahar_running():
-        return message("Please close Azahar first, then try again.")
+        message("Please close Azahar first, then try again.")
+        sys.exit(3)
 
     with zipfile.ZipFile(snap) as z:
         names = [n for n in z.namelist() if not n.startswith("config/") and not n.endswith("/")]
@@ -794,19 +809,89 @@ def download_azahar(update=True):
     return tag
 
 
-def install_mac_app(zip_path):
+def install_mac_app(zip_path, dest=MAC_APP, keep_zip=False):
     extract = INSTALL_DIR / "extract"
     shutil.rmtree(extract, ignore_errors=True)
     # ditto, not zipfile: it keeps the executable bits and the app's code signature intact.
     subprocess.run(["ditto", "-x", "-k", str(zip_path), str(extract)], check=True)
-    app = next(extract.glob("**/Azahar.app"))
-    MAC_APP.parent.mkdir(exist_ok=True)
-    if MAC_APP.exists():
-        shutil.rmtree(MAC_APP)
-    shutil.move(str(app), str(MAC_APP))
-    subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(MAC_APP)], stderr=subprocess.DEVNULL)
+    app = next(extract.glob(f"**/{dest.name}"))
+    dest.parent.mkdir(exist_ok=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.move(str(app), str(dest))
+    subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(dest)], stderr=subprocess.DEVNULL)
     shutil.rmtree(extract)
-    zip_path.unlink()
+    if not keep_zip:
+        zip_path.unlink()
+
+
+def launcher_download():
+    """The 3DS app for this computer: a local build (THREEDS_LAUNCHER, for testing) or this
+    release's download. None if there's no build for this computer."""
+    if os.environ.get("THREEDS_LAUNCHER"):
+        return Path(os.environ["THREEDS_LAUNCHER"])
+    key = "mac" if IS_MAC else "linux" if platform.machine() in ("x86_64", "amd64") else None
+    if key not in LAUNCHER:
+        return None
+    name, sha256 = LAUNCHER[key]
+    dest = INSTALL_DIR / name
+    print("Downloading the 3DS app...")
+    download(f"https://github.com/erickfm/3ds-setup/releases/download/{RELEASE_TAG}/{name}", dest, sha256)
+    return dest
+
+
+def install_launcher():
+    """Install the 3DS app. Returns False (and setup carries on without it) if it can't run here."""
+    try:
+        src = launcher_download()
+    except Exception as e:
+        log(f"couldn't download the 3DS app: {e!r}")
+        return False
+    if not src:
+        return False
+    local = "THREEDS_LAUNCHER" in os.environ
+    if IS_MAC:
+        install_mac_app(src, MAC_LAUNCHER, keep_zip=local)
+        return True
+    with tarfile.open(src) as tar:
+        for name, dest in (("3ds-launcher", LAUNCHER_BIN), ("3ds.png", LAUNCHER_ICON)):
+            tmp = dest.with_name(dest.name + ".partial")
+            with tar.extractfile(name) as f, open(tmp, "wb") as out:
+                shutil.copyfileobj(f, out)
+            os.replace(tmp, dest)
+    if not local:
+        src.unlink()
+    LAUNCHER_BIN.chmod(0o755)
+    missing = subprocess.run(["ldd", str(LAUNCHER_BIN)], capture_output=True, text=True).stdout
+    missing = [line.split()[0] for line in missing.splitlines() if "not found" in line]
+    if missing:
+        print(f"\nThe 3DS app needs some system libraries this computer doesn't have ({', '.join(missing)}).\n"
+              "On Ubuntu/Debian: sudo apt install libwebkit2gtk-4.1-0   (then run the install again)")
+        LAUNCHER_BIN.unlink()
+        return False
+    return True
+
+
+def open_launcher():
+    if QUIET:
+        return
+    if IS_MAC:
+        subprocess.run(["open", str(MAC_LAUNCHER)], stderr=subprocess.DEVNULL)
+    else:
+        subprocess.Popen([str(LAUNCHER_BIN)], start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_launcher():
+    if IS_MAC:
+        subprocess.run(["pkill", "-f", str(MAC_LAUNCHER / "Contents/MacOS")], stderr=subprocess.DEVNULL)
+        return
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            if os.readlink(proc / "exe") == str(LAUNCHER_BIN):
+                os.kill(int(proc.name), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
 
 
 def choose_backup_dir(default):
@@ -822,8 +907,8 @@ def choose_backup_dir(default):
     return answer or default
 
 
-def install_helpers(me):
-    """Double-clickable shortcuts for back up / restore / uninstall."""
+def install_helpers(me, launcher):
+    """Double-clickable shortcuts for back up / restore / uninstall (and the 3DS app on Linux)."""
     py = sys.executable
     if IS_MAC:
         MAC_HELPERS.mkdir(parents=True, exist_ok=True)
@@ -842,9 +927,15 @@ def install_helpers(me):
         "3ds-setup-restore.desktop": ("Restore 3DS saves", f'"{py}" "{me}" --pause restore', True),
         "3ds-setup-uninstall.desktop": ("Uninstall 3DS Setup", f'"{py}" "{me}" --pause uninstall', True),
     }
+    if launcher:
+        entries["3ds-setup-launcher.desktop"] = ("3DS", f'"{LAUNCHER_BIN}"', False)
+    else:
+        (LINUX_APPS / "3ds-setup-launcher.desktop").unlink(missing_ok=True)
     for fname, (name, exec_, terminal) in entries.items():
         extra = ("MimeType=application/x-ctr-3dsx;application/x-ctr-cci;application/x-ctr-cia;"
-                 "application/x-ctr-cxi;\n") if not terminal else ""
+                 "application/x-ctr-cxi;\n") if fname.startswith("azahar") else ""
+        if fname == "3ds-setup-launcher.desktop":
+            extra = f"Icon={LAUNCHER_ICON}\nComment=Play your 3DS games\nStartupWMClass=3ds-launcher\n"
         (LINUX_APPS / fname).write_text(
             f"[Desktop Entry]\nType=Application\nName={name}\nExec={exec_}\n"
             f"Terminal={'true' if terminal else 'false'}\nCategories=Game;Emulator;\n{extra}")
@@ -934,16 +1025,24 @@ def cmd_install(args):
         print("(Azahar is open, so its settings were left alone. Re-run install after closing it.)")
     else:
         setup_azahar_config(cfg, cfg["controller"])
-    install_helpers(me)
+    launcher = install_launcher()
+    install_helpers(me, launcher)
     start_watcher_at_login(me)
 
-    log(f"installed Azahar {tag}; backups -> {cfg['backup_dir']}")
-    where = "in your Applications folder" if IS_MAC else "in your app menu as 'Azahar (3DS)'"
-    message(f"All set! Azahar is {where}.\n\n"
-            f"Put your 3DS games in the '3DS Games' folder (it opens next), "
-            f"and they'll show up in Azahar.\n\n"
-            f"Your saves back up automatically to:\n{cfg['backup_dir']}")
-    open_folder(cfg["games_dir"])
+    log(f"installed Azahar {tag}; backups -> {cfg['backup_dir']}" + ("; 3DS app" if launcher else ""))
+    if launcher:
+        where = "in your Applications folder" if IS_MAC else "in your app menu"
+        message(f"All set! The 3DS app opens next. Add your games there and press Play.\n\n"
+                f"You'll find it {where} as '3DS'.\n\n"
+                f"Your saves back up automatically to:\n{cfg['backup_dir']}")
+        open_launcher()
+    else:
+        where = "in your Applications folder" if IS_MAC else "in your app menu as 'Azahar (3DS)'"
+        message(f"All set! Azahar is {where}.\n\n"
+                f"Put your 3DS games in the '3DS Games' folder (it opens next), "
+                f"and they'll show up in Azahar.\n\n"
+                f"Your saves back up automatically to:\n{cfg['backup_dir']}")
+        open_folder(cfg["games_dir"])
     if IS_MAC:
         print("For auto save-states, macOS will ask to let python3 control your computer\n"
               "(Accessibility). Allow it in System Settings > Privacy & Security > Accessibility.")
@@ -964,11 +1063,18 @@ def cmd_uninstall(args):
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     stop_watcher()
+    stop_launcher()
     for p in (LAUNCH_AGENT, LINUX_AUTOSTART, BIN_LINK, *LINUX_APPS.glob("*3ds-setup*.desktop")):
         if p.is_symlink() or p.exists():
             p.unlink()
-    for d in (MAC_APP if IS_MAC else None, MAC_HELPERS if IS_MAC else None):
-        if d and d.exists():
+    if IS_MAC:
+        lib = HOME / "Library"
+        app_dirs = [MAC_APP, MAC_HELPERS, MAC_LAUNCHER, lib / "Application Support" / LAUNCHER_ID,
+                    lib / "Caches" / LAUNCHER_ID, lib / "WebKit" / LAUNCHER_ID]
+    else:
+        app_dirs = [XDG_DATA / LAUNCHER_ID, HOME / ".cache" / LAUNCHER_ID]
+    for d in app_dirs:
+        if d.exists():
             shutil.rmtree(d)
     kept = []
     if INSTALL_DIR.exists():

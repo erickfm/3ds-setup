@@ -39,6 +39,12 @@ $TitlesPath = "$InstallDir\titles.json"
 $UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\3ds-setup'
 # Used when the backup folder is missing (e.g. external drive unplugged); moved over once it's back.
 $FallbackDir = "$InstallDir\pending-backups"
+$Heartbeat = "$InstallDir\watch.heartbeat"  # touched every tick so the 3DS app can tell the watcher runs
+# The 3DS app (launcher\ in the repo). tools/build-release.py fills these in for each release.
+$ReleaseTag = ''
+$Launcher = @{}
+$LauncherExe = "$InstallDir\3DS.exe"
+$LauncherId = 'io.github.erickfm.threeds'  # the app's identifier; its web view keeps data under it
 $Host_ = $env:COMPUTERNAME
 $TickSeconds = 15
 
@@ -353,12 +359,14 @@ function Invoke-Autosave($cfg) {
 
 function Invoke-Watch {
     $mutex = New-Object Threading.Mutex($false, 'Local\3ds-setup-watch')
-    if (-not $mutex.WaitOne(0)) { Write-Host 'watcher already running'; return }
+    try { $mine = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $mine = $true }
+    if (-not $mine) { Write-Host 'watcher already running'; return }
     Log 'watcher started'
     $wasRunning = $false
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $lastBackup = 0; $lastAutosave = 0
     while ($true) {
+        try { [IO.File]::WriteAllText($Heartbeat, '') } catch {}
         $cfg = Get-Config  # pick up edits without a restart
         $running = Test-AzaharRunning
         $now = $clock.Elapsed.TotalSeconds
@@ -638,7 +646,7 @@ function Invoke-Restore {
     } else {
         $snap = $Snapshot
     }
-    if (Test-AzaharRunning) { Show-Message 'Please close Azahar first, then try again.' -Warning; return }
+    if (Test-AzaharRunning) { Show-Message 'Please close Azahar first, then try again.' -Warning; exit 3 }
 
     $root = Get-AzaharUserDir
     $zip = [IO.Compression.ZipFile]::OpenRead($snap)
@@ -713,6 +721,55 @@ function Install-VcRuntime {
     Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
 }
 
+function Install-WebView2 {
+    # The 3DS app draws its window with Microsoft Edge WebView2, which Windows 10/11 almost always has.
+    $client = 'Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+    foreach ($k in "HKLM:\SOFTWARE\WOW6432Node\$client", "HKLM:\SOFTWARE\$client", "HKCU:\Software\$client") {
+        $v = (Get-ItemProperty -Path $k -ErrorAction SilentlyContinue).pv
+        if ($v -and $v -ne '0.0.0.0') { return }
+    }
+    Write-Host 'Installing Microsoft Edge WebView2, which the 3DS app needs...'
+    $exe = Join-Path $env:TEMP 'MicrosoftEdgeWebview2Setup.exe'
+    Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $exe -UseBasicParsing
+    $sig = Get-AuthenticodeSignature -FilePath $exe
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+        Remove-Item -LiteralPath $exe -Force
+        throw 'the WebView2 download could not be verified'
+    }
+    Start-Process -FilePath $exe -ArgumentList '/silent', '/install' -Wait
+    Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-Launcher {
+    $p = @(Get-Process -Name '3DS' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $LauncherExe })
+    if ($p.Count) { $p | Stop-Process -Force; Start-Sleep -Seconds 1 }
+}
+
+function Install-Launcher {
+    # The 3DS app. Returns $false (and setup carries on without it) if it can't be set up.
+    try {
+        if ($env:THREEDS_LAUNCHER) {
+            $src = $env:THREEDS_LAUNCHER  # a local build, for testing
+        } elseif ($Launcher.name) {
+            $src = Join-Path $env:TEMP "$App-$($Launcher.name)"
+            Write-Host 'Downloading the 3DS app...'
+            Invoke-WebRequest -Uri "https://github.com/erickfm/3ds-setup/releases/download/$ReleaseTag/$($Launcher.name)" -OutFile $src -UseBasicParsing -Headers @{ 'User-Agent' = $App }
+            if ((Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash -ne $Launcher.sha256) { throw 'the download was corrupted (checksum mismatch)' }
+        } else {
+            return $false
+        }
+        Install-WebView2
+        Stop-Launcher
+        Copy-Item -LiteralPath $src -Destination $LauncherExe -Force
+        Unblock-File -LiteralPath $LauncherExe
+        if (-not $env:THREEDS_LAUNCHER) { Remove-Item -LiteralPath $src -Force }
+        return $true
+    } catch {
+        Log "couldn't set up the 3DS app: $_"
+        return $false
+    }
+}
+
 function Install-Titles {
     $here = Split-Path $PSCommandPath
     foreach ($local in (Join-Path $here 'titles.json'), (Join-Path (Split-Path $here) 'titles.json')) {
@@ -785,13 +842,22 @@ function Invoke-Install {
     if (Test-AzaharRunning) { Write-Host '(Azahar is open, so its settings were left alone. Run Update Azahar after closing it.)' }
     else { Set-AzaharConfig $cfg ([bool]$cfg.controller) }
 
+    $launcherOk = Install-Launcher
+
     $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $run = "-NoProfile -ExecutionPolicy Bypass -File `"$me`""
     $hidden = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$me`""
     $explorer = "$env:SystemRoot\explorer.exe"
     $folderIcon = "$env:SystemRoot\System32\shell32.dll,3"
-    New-Shortcut (Join-Path $Desktop 'Azahar (3DS).lnk') $AzaharExe '' $AzaharDir
-    New-Shortcut (Join-Path $Desktop '3DS Games.lnk') $explorer "`"$($cfg.games_dir)`"" '' 1 $folderIcon
+    if ($launcherOk) {
+        # One icon on the Desktop: the 3DS app does the rest.
+        New-Shortcut (Join-Path $Desktop '3DS.lnk') $LauncherExe '' $InstallDir
+        New-Shortcut "$StartMenu\3DS.lnk" $LauncherExe '' $InstallDir
+        foreach ($old in 'Azahar (3DS).lnk', '3DS Games.lnk') { Remove-Item -LiteralPath (Join-Path $Desktop $old) -Force -ErrorAction SilentlyContinue }
+    } else {
+        New-Shortcut (Join-Path $Desktop 'Azahar (3DS).lnk') $AzaharExe '' $AzaharDir
+        New-Shortcut (Join-Path $Desktop '3DS Games.lnk') $explorer "`"$($cfg.games_dir)`"" '' 1 $folderIcon
+    }
     New-Shortcut "$StartMenu\Azahar (3DS).lnk" $AzaharExe '' $AzaharDir
     New-Shortcut "$StartMenu\3DS Games folder.lnk" $explorer "`"$($cfg.games_dir)`"" '' 1 $folderIcon
     New-Shortcut "$StartMenu\Back up 3DS saves now.lnk" $ps "$hidden backup" '' 7 $AzaharExe
@@ -805,7 +871,7 @@ function Invoke-Install {
     New-Item -Path $UninstallKey -Force | Out-Null
     $props = @{
         DisplayName = '3DS Setup (Azahar emulator + save backups)'; DisplayVersion = $tag; Publisher = '3ds-setup'
-        DisplayIcon = $AzaharExe; InstallLocation = $AzaharDir; UninstallString = "`"$ps`" $hidden uninstall"
+        DisplayIcon = $(if ($launcherOk) { $LauncherExe } else { $AzaharExe }); InstallLocation = $AzaharDir; UninstallString = "`"$ps`" $hidden uninstall"
     }
     foreach ($k in $props.Keys) { Set-ItemProperty -Path $UninstallKey -Name $k -Value $props[$k] }
     foreach ($k in 'NoModify', 'NoRepair') { New-ItemProperty -Path $UninstallKey -Name $k -Value 1 -PropertyType DWord -Force | Out-Null }
@@ -813,9 +879,14 @@ function Invoke-Install {
     Stop-Watcher
     Start-Process -FilePath $ps -ArgumentList "$hidden watch" -WindowStyle Hidden
 
-    Log "installed Azahar $tag; backups -> $($cfg.backup_dir)"
-    Show-Message "All set! Open Azahar from the 'Azahar (3DS)' icon on your Desktop.`n`nPut your 3DS games in the '3DS Games' folder (it opens next, and there's a shortcut on your Desktop). They'll show up in Azahar.`n`nYour saves back up automatically to:`n$($cfg.backup_dir)"
-    if (-not $Quiet) { Start-Process -FilePath $explorer -ArgumentList "`"$($cfg.games_dir)`"" }
+    Log "installed Azahar $tag; backups -> $($cfg.backup_dir)$(if ($launcherOk) { '; 3DS app' })"
+    if ($launcherOk) {
+        Show-Message "All set! The 3DS app opens next. Add your games there and press Play.`n`nYou'll find it on your Desktop and in the Start menu as '3DS'.`n`nYour saves back up automatically to:`n$($cfg.backup_dir)"
+        if (-not $Quiet) { Start-Process -FilePath $LauncherExe }
+    } else {
+        Show-Message "All set! Open Azahar from the 'Azahar (3DS)' icon on your Desktop.`n`nPut your 3DS games in the '3DS Games' folder (it opens next, and there's a shortcut on your Desktop). They'll show up in Azahar.`n`nYour saves back up automatically to:`n$($cfg.backup_dir)"
+        if (-not $Quiet) { Start-Process -FilePath $explorer -ArgumentList "`"$($cfg.games_dir)`"" }
+    }
 }
 
 function Invoke-Uninstall {
@@ -824,7 +895,8 @@ function Invoke-Uninstall {
     if (Test-AzaharRunning) { Show-Message 'Please close Azahar first, then try again.' -Warning; return }
     $saves = Get-AzaharUserDir
     Stop-Watcher
-    foreach ($p in $StartupLink, (Join-Path $Desktop 'Azahar (3DS).lnk'), (Join-Path $Desktop '3DS Games.lnk'), $StartMenu, $UninstallKey) {
+    Stop-Launcher
+    foreach ($p in $StartupLink, (Join-Path $Desktop 'Azahar (3DS).lnk'), (Join-Path $Desktop '3DS Games.lnk'), (Join-Path $Desktop '3DS.lnk'), $StartMenu, $UninstallKey, "$env:LOCALAPPDATA\$LauncherId") {
         if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
     }
     # Program files go; a portable 'user' folder (which holds saves) stays.

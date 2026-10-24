@@ -1,6 +1,6 @@
-# Runs the real installer on real Windows, macOS and Linux machines, then backs up and
-# restores a fake save and uninstalls. On a version tag (v1.2.3) it also publishes the
-# release files people download.
+# Builds the 3DS app, then runs the real installer (with that app) on real Windows, macOS
+# and Linux machines, backs up and restores a fake save, and uninstalls. On a version tag
+# (v1.2.3) it also publishes the release files people download.
 name: test
 
 on:
@@ -12,7 +12,59 @@ env:
   CI: "true"  # makes the scripts skip every dialog
 
 jobs:
+  launcher:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04  # older glibc, so the app runs on older Linux too
+            file: 3ds-launcher-linux-x86_64.tar.gz
+          - os: windows-latest
+            file: 3ds-launcher-windows-x64.exe
+          - os: macos-latest
+            file: 3DS-macOS.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: launcher
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux build libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          if [ "$RUNNER_OS" = macOS ]; then rustup target add aarch64-apple-darwin x86_64-apple-darwin; fi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher
+      - name: Unit tests
+        run: cargo test
+      - name: Build
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            npx --yes @tauri-apps/cli@2.12.1 build --target universal-apple-darwin --bundles app
+            ditto -c -k --keepParent target/universal-apple-darwin/release/bundle/macos/3DS.app "../${{ matrix.file }}"
+          elif [ "$RUNNER_OS" = Windows ]; then
+            npx --yes @tauri-apps/cli@2.12.1 build --no-bundle
+            cp target/release/3ds-launcher.exe "../${{ matrix.file }}"
+          else
+            npx --yes @tauri-apps/cli@2.12.1 build --no-bundle
+            cp icons/128x128@2x.png target/release/3ds.png
+            tar -czf "../${{ matrix.file }}" -C target/release 3ds-launcher 3ds.png
+          fi
+          ls -la "../${{ matrix.file }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.file }}
+          path: ${{ matrix.file }}
+          if-no-files-found: error
+
   windows:
+    needs: launcher
     runs-on: windows-latest
     timeout-minutes: 25
     defaults:
@@ -20,6 +72,13 @@ jobs:
         shell: powershell  # Windows PowerShell 5.1, what real users have (not pwsh)
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: 3ds-launcher-windows-x64.exe
+          path: ${{ runner.temp }}/launcher
+      - name: Use the app built above
+        run: Add-Content $env:GITHUB_ENV "THREEDS_LAUNCHER=$env:RUNNER_TEMP\launcher\3ds-launcher-windows-x64.exe"
 
       - name: Install from the single-file download
         shell: cmd
@@ -40,11 +99,12 @@ jobs:
           function Need($cond, $what) { if (-not $cond) { throw "missing: $what" } ; Write-Host "ok: $what" }
           Need (Test-Path "$env:LOCALAPPDATA\Programs\Azahar\azahar.exe") 'azahar.exe'
           Need (Test-Path "$env:LOCALAPPDATA\3ds-setup\titles.json") 'titles.json'
+          Need (Test-Path "$env:LOCALAPPDATA\3ds-setup\3DS.exe") '3DS app'
           $desktop = [Environment]::GetFolderPath('Desktop')
-          Need (Test-Path "$desktop\Azahar (3DS).lnk") 'desktop shortcut'
-          Need (Test-Path "$desktop\3DS Games.lnk") 'games folder shortcut'
+          Need (Test-Path "$desktop\3DS.lnk") 'desktop shortcut'
+          Need (-not (Test-Path "$desktop\Azahar (3DS).lnk")) 'no extra desktop shortcuts'
           $menu = Join-Path ([Environment]::GetFolderPath('Programs')) '3DS (Azahar)'
-          foreach ($l in 'Restore 3DS saves', 'Back up 3DS saves now', 'Uninstall 3DS Setup') { Need (Test-Path "$menu\$l.lnk") "start menu: $l" }
+          foreach ($l in '3DS', 'Restore 3DS saves', 'Back up 3DS saves now', 'Uninstall 3DS Setup') { Need (Test-Path "$menu\$l.lnk") "start menu: $l" }
           Need (Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) '3DS save backups.lnk')) 'startup entry'
           Need (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\3ds-setup') 'Apps & features entry'
           Need (Test-Path (Join-Path ([Environment]::GetFolderPath('MyDocuments')) '3DS Games')) 'games folder'
@@ -54,6 +114,16 @@ jobs:
           Start-Sleep 3
           $w = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*3ds-setup.ps1*watch*' })
           Need ($w.Count -eq 1) "exactly one watcher (found $($w.Count))"
+          Start-Sleep 15
+          Need (Test-Path "$env:LOCALAPPDATA\3ds-setup\watch.heartbeat") 'watcher heartbeat'
+
+      - name: The 3DS app starts and stays up
+        run: |
+          $p = Start-Process "$env:LOCALAPPDATA\3ds-setup\3DS.exe" -PassThru
+          Start-Sleep 12
+          if ($p.HasExited) { throw "the 3DS app quit right away (exit code $($p.ExitCode))" }
+          $p | Stop-Process -Force
+          Write-Host 'ok: 3DS app runs'
 
       - name: Watcher notices Azahar
         continue-on-error: true  # Azahar may not start on a GPU-less runner
@@ -88,6 +158,8 @@ jobs:
           windows\3ds-setup.ps1 uninstall -Yes -Quiet
           Start-Sleep 2
           if (Test-Path "$env:LOCALAPPDATA\Programs\Azahar\azahar.exe") { throw 'azahar.exe still there' }
+          if (Test-Path "$env:LOCALAPPDATA\3ds-setup\3DS.exe") { throw '3DS app still there' }
+          if (Test-Path "$([Environment]::GetFolderPath('Desktop'))\3DS.lnk") { throw 'desktop shortcut still there' }
           if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\3ds-setup') { throw 'Apps entry still there' }
           if (-not (Test-Path "$env:APPDATA\Azahar\sdmc\Nintendo 3DS\0\0\title\00040000\00055d00\data\1\main")) { throw 'saves were deleted!' }
           if (-not (Get-ChildItem "$env:RUNNER_TEMP\bk" -Recurse -Filter *.zip)) { throw 'backups were deleted!' }
@@ -96,6 +168,7 @@ jobs:
           Write-Host 'ok: uninstalled, saves and backups kept'
 
   unix:
+    needs: launcher
     strategy:
       fail-fast: false
       matrix:
@@ -104,6 +177,15 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ runner.os == 'macOS' && '3DS-macOS.zip' || '3ds-launcher-linux-x86_64.tar.gz' }}
+          path: ${{ runner.temp }}/launcher
+      - name: Use the app built above
+        run: |
+          echo "THREEDS_LAUNCHER=$(ls "$RUNNER_TEMP"/launcher/*)" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-0 xvfb; fi
 
       - name: Install
         run: sh mac-linux/install.sh --backup-dir "$RUNNER_TEMP/bk" --controller yes
@@ -115,18 +197,37 @@ jobs:
             test -d "$HOME/Applications/Azahar.app" && echo "ok: Azahar.app"
             test -x "$HOME/Library/Application Support/3ds-setup/python/bin/python3" && echo "ok: bundled python"
             test -d "$HOME/Applications/3DS Setup/Restore 3DS Saves.app" && echo "ok: restore app"
+            test -n "$(ls "$HOME/Applications/3DS.app/Contents/MacOS/")" && echo "ok: 3DS app"
             launchctl print "gui/$(id -u)/io.github.erickfm.3ds-setup" >/dev/null && echo "ok: launch agent loaded"
             codesign --verify --deep "$HOME/Applications/Azahar.app" && echo "ok: Azahar signature intact" || echo "note: Azahar.app signature check failed"
             INI="$HOME/Library/Application Support/Azahar/config/qt-config.ini"
           else
             test -x "$HOME/.local/share/3ds-setup/azahar.AppImage" && echo "ok: AppImage"
             test -f "$HOME/.local/share/applications/3ds-setup-restore.desktop" && echo "ok: restore menu entry"
+            test -x "$HOME/.local/share/3ds-setup/3ds-launcher" && echo "ok: 3DS app"
+            test -f "$HOME/.local/share/applications/3ds-setup-launcher.desktop" && echo "ok: 3DS app menu entry"
             INI="$HOME/.config/azahar-emu/qt-config.ini"
           fi
           test -d "$HOME/Documents/3DS Games" || test -d "$HOME/3DS Games"
           grep -q '3DS Games' "$INI" && echo "ok: games folder in Azahar settings"
           grep -q 'maptype:all' "$INI" && echo "ok: controller preset"
-          sleep 3; ~/.local/bin/3ds-setup status
+          sleep 20; ~/.local/bin/3ds-setup status
+          if [ "$(uname)" = Darwin ]; then H="$HOME/Library/Application Support/3ds-setup"; else H="$HOME/.local/share/3ds-setup"; fi
+          test -f "$H/watch.heartbeat" && echo "ok: watcher heartbeat"
+
+      - name: The 3DS app starts and stays up
+        run: |
+          if [ "$(uname)" = Darwin ]; then
+            open "$HOME/Applications/3DS.app"; sleep 12
+            pgrep -f "3DS.app/Contents/MacOS/" >/dev/null || { echo "the 3DS app isn't running"; exit 1; }
+            pkill -f "3DS.app/Contents/MacOS/"
+          else
+            set +e
+            timeout 12 xvfb-run -a "$HOME/.local/share/3ds-setup/3ds-launcher"
+            code=$?
+            [ $code -eq 124 ] || { echo "the 3DS app quit early (exit $code)"; exit 1; }
+          fi
+          echo "ok: 3DS app runs"
 
       - name: Watcher notices Azahar (macOS)
         if: runner.os == 'macOS'
@@ -159,10 +260,12 @@ jobs:
           ~/.local/bin/3ds-setup uninstall --yes || "$HOME/Library/Application Support/3ds-setup/python/bin/python3" mac-linux/3ds-setup.py uninstall --yes
           if [ "$(uname)" = Darwin ]; then
             test ! -e "$HOME/Applications/Azahar.app"
+            test ! -e "$HOME/Applications/3DS.app"
             if launchctl print "gui/$(id -u)/io.github.erickfm.3ds-setup" >/dev/null 2>&1; then echo "launch agent still loaded"; exit 1; fi
             U="$HOME/Library/Application Support/Azahar"
           else
             test ! -e "$HOME/.local/share/3ds-setup/azahar.AppImage"
+            test ! -e "$HOME/.local/share/3ds-setup/3ds-launcher"
             U="$HOME/.local/share/azahar-emu"
           fi
           test -f "$U/sdmc/Nintendo 3DS/0/0/title/00040000/00055d00/data/1/main"
@@ -175,6 +278,7 @@ jobs:
             echo "no release published yet, skipping"; exit 0
           fi
           cd "$RUNNER_TEMP"
+          unset THREEDS_LAUNCHER  # use the app published with the release
           curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh | sh -s -- --backup-dir "$RUNNER_TEMP/bk2" --controller no
           ~/.local/bin/3ds-setup status
 
@@ -186,7 +290,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - run: python3 tools/build-release.py
+      - uses: actions/download-artifact@v4
+        with:
+          path: launchers
+          merge-multiple: true
+      - run: python3 tools/build-release.py --tag "$GITHUB_REF_NAME" --launchers launchers
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}

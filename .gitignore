@@ -1,3 +1,5 @@
 __pycache__/
 *.partial
 dist/
+launcher/target/
+launcher/gen/

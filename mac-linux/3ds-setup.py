@@ -2,11 +2,12 @@
 """3ds-setup (Linux + macOS): install Azahar (3DS emulator) and keep your saves backed up.
 
 Commands:
-  install   download/update Azahar, pick a backup folder, start the background watcher
-  watch     background loop: while Azahar runs, back up saves and auto save-state
-  backup    back up right now
-  restore   list save snapshots, or restore one (optionally just one game)
-  status    show where everything is
+  install    download/update Azahar, pick a backup folder, start the background watcher
+  watch      background loop: while Azahar runs, back up saves and auto save-state
+  backup     back up right now
+  restore    pick a backup to bring back (or: restore <number> [--game ID])
+  status     show where everything is
+  uninstall  remove Azahar and 3ds-setup (saves and backups are kept)
 """
 import argparse
 import datetime as dt
@@ -19,6 +20,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -28,6 +30,7 @@ from pathlib import Path
 
 APP = "3ds-setup"
 RELEASE_API = "https://api.github.com/repos/azahar-emu/azahar/releases/latest"
+OUR_RELEASE = "https://github.com/erickfm/3ds-setup/releases/latest/download"
 HOME = Path.home()
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
@@ -40,17 +43,23 @@ else:
     CONFIG_PATH = XDG_CONFIG / APP / "config.json"
 LOG_PATH = INSTALL_DIR / "3ds-setup.log"
 LOCK_PATH = INSTALL_DIR / "watch.lock"
+TITLES_PATH = INSTALL_DIR / "titles.json"
 APPIMAGE = INSTALL_DIR / "azahar.AppImage"
 MAC_APP = HOME / "Applications/Azahar.app"
+MAC_HELPERS = HOME / "Applications/3DS Setup"
 AZAHAR_PATH = MAC_APP if IS_MAC else APPIMAGE
 LAUNCH_AGENT_LABEL = "io.github.erickfm.3ds-setup"
 LAUNCH_AGENT = HOME / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+LINUX_APPS = XDG_DATA / "applications"
+LINUX_AUTOSTART = XDG_CONFIG / "autostart" / "3ds-setup-watch.desktop"
+BIN_LINK = HOME / ".local/bin/3ds-setup"
 VERSION_FILE = INSTALL_DIR / "azahar-version.txt"
 # Used when the backup folder is missing (e.g. external drive unplugged); moved over once it's back.
 FALLBACK_DIR = INSTALL_DIR / "pending-backups"
 
 DEFAULTS = {
     "backup_dir": str(HOME / "3DS-Backups"),
+    "games_dir": str((HOME / "Documents" if (HOME / "Documents").is_dir() else HOME) / "3DS Games"),
     "backup_every_minutes": 5,
     "autosave_state_every_minutes": 10,  # 0 turns auto save-states off
     "autosave_hotkey": "ctrl+c",  # Azahar default for "Save to Oldest Non-Quicksave Slot"
@@ -76,10 +85,7 @@ def log(msg):
 
 def notify(msg):
     if IS_MAC:
-        subprocess.run(["osascript", "-e", "on run argv", "-e",
-                        'display notification (item 1 of argv) with title "3DS backups"',
-                        "-e", "end run", msg],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        osascript('display notification (item 1 of argv) with title "3DS backups"', msg)
     elif shutil.which("notify-send"):
         subprocess.run(["notify-send", "-a", "3DS backups", "3DS backups", msg],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -134,6 +140,90 @@ def write_atomic_copy(src, dest):
     os.replace(tmp, dest)
 
 
+def fetch(url, timeout=60):
+    # The standalone Python we bring on macOS may not find the system's root certificates.
+    ctx = None
+    if IS_MAC and Path("/etc/ssl/cert.pem").exists():
+        ctx = ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+    req = urllib.request.Request(url, headers={"User-Agent": APP})
+    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+
+def download(url, dest, sha256=None):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".partial")
+    with fetch(url) as r, open(tmp, "wb") as f:
+        shutil.copyfileobj(r, f)
+    if sha256:
+        h = hashlib.sha256()
+        with open(tmp, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != sha256:
+            tmp.unlink()
+            raise RuntimeError(f"download of {url} was corrupted (checksum mismatch)")
+    os.replace(tmp, dest)
+
+
+# ---------------------------------------------------------------- dialogs
+# macOS gets real dialog windows; Linux uses the terminal.
+
+QUIET = False  # --quiet: never show dialogs (used by CI)
+
+
+def osascript(script, *args):
+    """Run AppleScript with args passed as argv (never pasted into the script)."""
+    lines = ["on run argv"] + script.splitlines() + ["end run"]
+    cmd = ["osascript"]
+    for line in lines:
+        cmd += ["-e", line]
+    return subprocess.run(cmd + list(args), capture_output=True, text=True)
+
+
+def message(text):
+    if QUIET:
+        print(text)
+    elif IS_MAC:
+        osascript('display dialog (item 1 of argv) buttons {"OK"} default button 1 '
+                  'with title "3DS Setup"', text)
+    else:
+        print("\n" + text)
+
+
+def ask_yes_no(question, yes="Yes", no="No"):
+    if IS_MAC:
+        r = osascript('return button returned of (display dialog (item 1 of argv) '
+                      'buttons {(item 3 of argv), (item 2 of argv)} default button 2 '
+                      'with title "3DS Setup")', question, yes, no)
+        return r.stdout.strip() == yes
+    answer = input(f"\n{question} [{yes[0].lower()}/{no[0].lower()}]: ").strip().lower()
+    return answer.startswith(yes[0].lower())
+
+
+def pick(prompt, options):
+    """Let the user pick one of options. Returns its index, or None if cancelled."""
+    labels = [f"{i}. {o}" for i, o in enumerate(options, 1)]  # numbered, so labels are unique
+    if IS_MAC:
+        r = osascript('set r to choose from list (items 2 thru -1 of argv) with prompt (item 1 of argv) '
+                      'with title "3DS Setup"\nif r is false then return ""\nreturn item 1 of r',
+                      prompt, *labels)
+        choice = r.stdout.strip()
+        return labels.index(choice) if choice in labels else None
+    print(f"\n{prompt}")
+    for label in labels:
+        print(f"  {label}")
+    answer = input("Number (blank = cancel): ").strip()
+    if answer.isdigit() and 1 <= int(answer) <= len(options):
+        return int(answer) - 1
+    return None
+
+
+def open_folder(path):
+    if not QUIET:
+        subprocess.run(["open" if IS_MAC else "xdg-open", str(path)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ---------------------------------------------------------------- what counts as a save
 
 def is_save_path(rel):
@@ -186,6 +276,53 @@ def title_of(rel):
     if parts[0] == "sdmc" and parts[4] in ("title", "extdata") and len(parts) > 6:
         return (parts[5] + parts[6]).upper()
     return None
+
+
+def game_keys(names):
+    """Map each save file in a snapshot to the game it belongs to. A game's extra data
+    (extdata) is filed under the game itself, so restoring a game restores both."""
+    titles = {title_of(n) for n in names if title_of(n) and n.split("/")[4] == "title"}
+    by_unique_id = {(int(t[8:], 16) >> 8) & 0xFFFFF: t for t in titles}
+    keys = {}
+    for n in names:
+        t = title_of(n)
+        if t and n.split("/")[4] == "extdata":
+            t = by_unique_id.get(int(t[8:], 16), t)
+        keys[n] = t
+    return keys
+
+
+def load_titles():
+    try:
+        return json.loads(TITLES_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def game_name(tid, titles):
+    if tid in titles:
+        return titles[tid]
+    if tid.startswith("00000000"):
+        return f"Extra data {tid[8:]}"
+    return f"Unknown game ({tid})"
+
+
+def when_lower(text):
+    """'Today 7:30 PM' -> 'today 7:30 PM' (mid-sentence), leaving weekdays alone."""
+    return text[0].lower() + text[1:] if text.startswith(("Today", "Yesterday")) else f"on {text}"
+
+
+def friendly_time(snapshot):
+    """'Today 7:30 PM' / 'Yesterday 9:05 AM' / 'Thu Oct 23, 7:30 PM' from a snapshot's name."""
+    when = dt.datetime.strptime(snapshot.stem[:19], "%Y-%m-%d_%H-%M-%S")
+    clock = when.strftime("%I:%M %p").lstrip("0")
+    days = (dt.date.today() - when.date()).days
+    if days == 0:
+        return f"Today {clock}"
+    if days == 1:
+        return f"Yesterday {clock}"
+    year = f", {when.year}" if when.year != dt.date.today().year else ""
+    return f"{when:%a %b} {when.day}{year}, {clock}"
 
 
 # ---------------------------------------------------------------- backups
@@ -325,7 +462,7 @@ def autosave_unavailable(why):
 def focused_title():
     """Title of the focused window, or None if we can't find out on this system."""
     if IS_MAC:
-        r = subprocess.run(["osascript", "-e", MAC_FRONT_WINDOW], capture_output=True, text=True)
+        r = osascript(MAC_FRONT_WINDOW)
         if r.returncode != 0:
             return autosave_unavailable(
                 "allow Accessibility for python3 in System Settings > Privacy & Security")
@@ -337,8 +474,7 @@ def focused_title():
     return r.stdout.strip()
 
 
-MAC_FRONT_WINDOW = """
-tell application "System Events"
+MAC_FRONT_WINDOW = """tell application "System Events"
     set p to first application process whose frontmost is true
     if (count of windows of p) is 0 then return ""
     return name of front window of p
@@ -377,6 +513,117 @@ def try_autosave(cfg):
     press_hotkey(cfg["autosave_hotkey"])
     log(f"auto save-state ({title})")
     return True
+
+
+# ---------------------------------------------------------------- Azahar settings (qt-config.ini)
+
+def ini_quote(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def ini_section(lines, section):
+    """(start, end) line range of [section]'s body, or None."""
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == f"[{section}]":
+            start = i + 1
+        elif start is not None and line.startswith("["):
+            return start, i
+    return (start, len(lines)) if start is not None else None
+
+
+def ini_get(lines, section, key):
+    rng = ini_section(lines, section)
+    if rng:
+        for line in lines[rng[0]:rng[1]]:
+            if line.startswith(key + "="):
+                return line[len(key) + 1:].strip()
+    return None
+
+
+def ini_set(lines, section, items):
+    rng = ini_section(lines, section)
+    if rng is None:
+        lines += ["", f"[{section}]"]
+        rng = (len(lines), len(lines))
+    start, end = rng
+    for key, value in items.items():
+        for i in range(start, end):
+            if lines[i].startswith(key + "=") or lines[i].startswith(key + "\\default="):
+                lines[i] = None  # drop the old value and any "use default" flag
+        while end > start and lines[end - 1] is not None and not lines[end - 1].strip():
+            end -= 1  # insert before the blank line that ends the section
+        lines.insert(end, f"{key}={value}")
+        end += 1
+    lines[:] = [ln for ln in lines if ln is not None]
+
+
+# Azahar's own controller Auto-Map: buttons by position, like a real 3DS (SDL button numbers).
+CONTROLLER_BUTTONS = {
+    "button_a": (1, "B"), "button_b": (0, "A"), "button_x": (3, "Y"), "button_y": (2, "X"),
+    "button_up": (11, "D-Pad Up"), "button_down": (12, "D-Pad Down"),
+    "button_left": (13, "D-Pad Left"), "button_right": (14, "D-Pad Right"),
+    "button_l": (9, "LB"), "button_r": (10, "RB"), "button_start": (6, "Start"),
+    "button_select": (4, "Back"), "button_home": (5, "Guide"),
+}
+
+
+def controller_profile():
+    # maptype:all = whichever controller is plugged in, no device ID needed.
+    common = "api:controller,engine:sdl,guid:0,maptype:all,port:0"
+    p = {"profiles\\1\\name": "Default", "profiles\\1\\input_maptype": "0"}
+    for key, (button, name) in CONTROLLER_BUTTONS.items():
+        p[f"profiles\\1\\{key}"] = ini_quote(f"{common},button:{button},name:{name}")
+    for key, axis, name in (("button_zl", 4, "Left Trigger"), ("button_zr", 5, "Right Trigger")):
+        p[f"profiles\\1\\{key}"] = ini_quote(
+            f"{common},axis:{axis},direction:+,name:{name},threshold:0.500000")
+    p["profiles\\1\\circle_pad"] = ini_quote(
+        f"{common},axis_x:0,axis_y:1,name_x:Left Stick X,name_y:Left Stick Y")
+    p["profiles\\1\\c_stick"] = ini_quote(
+        f"{common},axis_x:2,axis_y:3,name_x:Right Stick X,name_y:Right Stick Y")
+    p["profiles\\size"] = "1"
+    p["profile"] = "0"
+    return p
+
+
+def setup_azahar_config(cfg, use_controller):
+    """Point Azahar's game list at the games folder, and (fresh setups only) map a controller.
+    Returns a list of what changed."""
+    _, config_dir = azahar_dirs()
+    ini = config_dir / "qt-config.ini"
+    lines = ini.read_text(encoding="utf-8").splitlines() if ini.exists() else []
+    done = []
+
+    games = Path(cfg["games_dir"]).as_posix()
+    size = int(ini_get(lines, "UI", "Paths\\gamedirs\\size") or 0)
+    existing = [ini_get(lines, "UI", f"Paths\\gamedirs\\{i}\\path") for i in range(1, size + 1)]
+    if games not in [(e or "").strip('"') for e in existing]:
+        items = {}
+        if size == 0:  # Azahar only adds these when the list is empty; keep them
+            for i, special in ((1, "INSTALLED"), (2, "SYSTEM")):
+                items[f"Paths\\gamedirs\\{i}\\path"] = special
+                items[f"Paths\\gamedirs\\{i}\\deep_scan"] = "false"
+                items[f"Paths\\gamedirs\\{i}\\expanded"] = "true"
+            size = 2
+        size += 1
+        items[f"Paths\\gamedirs\\{size}\\path"] = ini_quote(games)
+        items[f"Paths\\gamedirs\\{size}\\deep_scan"] = "true"
+        items[f"Paths\\gamedirs\\{size}\\expanded"] = "true"
+        items["Paths\\gamedirs\\size"] = str(size)
+        ini_set(lines, "UI", items)
+        done.append("games folder")
+
+    # Never replace a mapping someone already set up.
+    if use_controller and ini_get(lines, "Controls", "profiles\\size") is None:
+        ini_set(lines, "Controls", controller_profile())
+        done.append("controller")
+
+    if done:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        tmp = ini.with_name(ini.name + ".partial")
+        tmp.write_text("\n".join(lines).strip("\n") + "\n", encoding="utf-8")
+        os.replace(tmp, ini)
+    return done
 
 
 # ---------------------------------------------------------------- commands
@@ -431,9 +678,12 @@ def cmd_backup(args):
     backup_states(cfg)
     root, on_target = backup_root(cfg)
     if not on_target:
-        print(f"NOTE: {cfg['backup_dir']} isn't available, backed up to {root} instead")
-    if snap:
-        print(f"done: {snap}")
+        message(f"Your backup folder ({cfg['backup_dir']}) isn't available, so this backup "
+                f"was kept on this computer for now. It moves over once the folder is back.")
+    elif snap:
+        message("Backed up! Your saves are safe.")
+    else:
+        message("There are no saves to back up yet. Play a game and save first.")
 
 
 def list_snapshots(cfg):
@@ -447,35 +697,60 @@ def cmd_restore(args):
     cfg = load_config()
     snaps = list_snapshots(cfg)
     if not snaps:
-        sys.exit("no snapshots found")
-    if args.snapshot is None:
-        for i, s in enumerate(snaps[:30], 1):
-            with zipfile.ZipFile(s) as z:
-                titles = sorted({t for t in map(title_of, z.namelist()) if t})
-            print(f"{i:3}  {s.stem}   games: {', '.join(titles) or '-'}")
-        print("\nrestore with:  3ds-setup restore <number> [--game TITLEID]")
-        return
+        return message("There are no backups yet.")
+    titles = load_titles()
 
-    if args.snapshot.isdigit():
-        if not 1 <= int(args.snapshot) <= len(snaps):
-            sys.exit(f"pick a number from 1 to {len(snaps)} (run '3ds-setup restore' to list)")
-        snap = snaps[int(args.snapshot) - 1]
+    def games_in(snap):
+        with zipfile.ZipFile(snap) as z:
+            keys = game_keys([n for n in z.namelist() if not n.startswith("config/")])
+        return sorted({k for k in keys.values() if k}, key=lambda t: game_name(t, titles))
+
+    interactive = args.snapshot is None
+    if interactive:
+        shown = snaps[:50]
+        labels = []
+        for s in shown:
+            names = [game_name(t, titles) for t in games_in(s)]
+            labels.append(f"{friendly_time(s)}  -  {', '.join(names) or 'system data'}")
+        i = pick("Which backup do you want to go back to? (newest first)", labels)
+        if i is None:
+            return
+        snap = shown[i]
+        games = games_in(snap)
+        game = None
+        if len(games) > 1:
+            j = pick("Restore which game?", ["All games"] + [game_name(t, titles) for t in games])
+            if j is None:
+                return
+            game = games[j - 1] if j else None
+        elif games:
+            game = games[0]
+        what = game_name(game, titles) if game else "all your games"
+        if not ask_yes_no(f"Put {what} back to how it was {when_lower(friendly_time(snap))}?\n\n"
+                          f"Your current save is backed up first, so you can undo this.",
+                          "Restore", "Cancel"):
+            return
     else:
-        snap = Path(args.snapshot)
+        if args.snapshot.isdigit():
+            if not 1 <= int(args.snapshot) <= len(snaps):
+                sys.exit(f"pick a number from 1 to {len(snaps)} (run '3ds-setup restore' to list)")
+            snap = snaps[int(args.snapshot) - 1]
+        else:
+            snap = Path(args.snapshot)
+        game = args.game.upper() if args.game else None
+
     if azahar_running():
-        sys.exit("close Azahar first, then restore")
-    game = args.game.upper() if args.game else None
+        return message("Please close Azahar first, then try again.")
 
     with zipfile.ZipFile(snap) as z:
         names = [n for n in z.namelist() if not n.startswith("config/") and not n.endswith("/")]
         if game:
-            names = [n for n in names if (title_of(n) or "").endswith(game)]
+            keys = game_keys(names)
+            names = [n for n in names if (keys[n] or "").endswith(game)]
             if not names:
                 sys.exit(f"{snap.name} has no save for {game}")
 
-        print("backing up current saves first (so this can be undone)...")
         before = backup_saves(cfg, force=True, prune=False)  # don't prune what we're restoring
-
         data_dir, _ = azahar_dirs()
         for container in {c for c in map(save_container, names) if c}:
             shutil.rmtree(data_dir / container, ignore_errors=True)
@@ -486,14 +761,14 @@ def cmd_restore(args):
             target.parent.mkdir(parents=True, exist_ok=True)
             with z.open(n) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
-    print(f"restored {len(names)} files from {snap.name}")
-    if before:
-        print(f"your previous saves are in {before}")
+    log(f"restored {len(names)} files from {snap.name}" + (f" (game {game})" if game else ""))
+    undo = f"\n\nChanged your mind? Restore the backup from {friendly_time(before)}." if before else ""
+    message(f"Done! Restored from {friendly_time(snap)}.{undo}")
 
 
 def download_azahar(update=True):
-    req = urllib.request.Request(RELEASE_API, headers={"User-Agent": APP})
-    release = json.load(urllib.request.urlopen(req, timeout=30))
+    with fetch(RELEASE_API, timeout=30) as r:
+        release = json.load(r)
     tag = release["tag_name"]
     if AZAHAR_PATH.exists() and VERSION_FILE.exists() and VERSION_FILE.read_text().strip() == tag:
         print(f"Azahar {tag} already installed")
@@ -502,26 +777,14 @@ def download_azahar(update=True):
         return VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "?"
     if IS_MAC:
         if azahar_running():
-            sys.exit("close Azahar first so it can be updated")
+            sys.exit("Please close Azahar first so it can be updated.")
         asset = next(a for a in release["assets"]
                      if a["name"].startswith("azahar-macos-universal-") and a["name"].endswith(".zip"))
     else:
         asset = next(a for a in release["assets"] if a["name"] == "azahar.AppImage")
-    print(f"downloading Azahar {tag} ({asset['size'] // 2**20} MB)...")
-    tmp = INSTALL_DIR / (asset["name"] + ".partial")
-    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": APP})
-    with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
-        shutil.copyfileobj(r, f)
-    expected = (asset.get("digest") or "").removeprefix("sha256:")
-    if expected:
-        h = hashlib.sha256()
-        with open(tmp, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        if h.hexdigest() != expected:
-            tmp.unlink()
-            sys.exit("download checksum mismatch, aborting")
+    print(f"Downloading Azahar {tag} ({asset['size'] // 2**20} MB)...")
+    tmp = INSTALL_DIR / asset["name"]
+    download(asset["browser_download_url"], tmp, (asset.get("digest") or "").replace("sha256:", "", 1))
     if IS_MAC:
         install_mac_app(tmp)
     else:
@@ -547,15 +810,48 @@ def install_mac_app(zip_path):
 
 
 def choose_backup_dir(default):
-    print("Where should backups go? Pick an external drive or a synced folder (Dropbox etc).")
     if IS_MAC:
-        r = subprocess.run(["osascript", "-e", 'POSIX path of (choose folder with prompt '
-                            '"Where should 3DS save backups go? (external drive or a synced folder)")'],
-                           capture_output=True, text=True)
+        r = osascript('return POSIX path of (choose folder with prompt (item 1 of argv))',
+                      "Where should your 3DS save backups go?\n"
+                      "An external drive, or a folder that syncs (iCloud Drive, Dropbox), is safest.")
         if r.returncode == 0 and r.stdout.strip():
             return str(Path(r.stdout.strip()) / "3DS-Backups")
+        return default
+    print("\nWhere should backups go? Pick an external drive or a synced folder (Dropbox etc).")
     answer = input(f"Backup folder [{default}]: ").strip()
     return answer or default
+
+
+def install_helpers(me):
+    """Double-clickable shortcuts for back up / restore / uninstall."""
+    py = sys.executable
+    if IS_MAC:
+        MAC_HELPERS.mkdir(parents=True, exist_ok=True)
+        for name, cmd in (("Back Up 3DS Saves", "backup"), ("Restore 3DS Saves", "restore"),
+                          ("Uninstall 3DS Setup", "uninstall")):
+            app = MAC_HELPERS / f"{name}.app"
+            shutil.rmtree(app, ignore_errors=True)
+            script = (f'do shell script quoted form of "{applescript_str(py)}" & " " & '
+                      f'quoted form of "{applescript_str(str(me))}" & " {cmd}"')
+            subprocess.run(["osacompile", "-o", str(app), "-e", script], check=True)
+        return
+    LINUX_APPS.mkdir(parents=True, exist_ok=True)
+    entries = {
+        "azahar-3ds-setup.desktop": ("Azahar (3DS)", f'"{APPIMAGE}" %f', False),
+        "3ds-setup-backup.desktop": ("Back up 3DS saves", f'"{py}" "{me}" --pause backup', True),
+        "3ds-setup-restore.desktop": ("Restore 3DS saves", f'"{py}" "{me}" --pause restore', True),
+        "3ds-setup-uninstall.desktop": ("Uninstall 3DS Setup", f'"{py}" "{me}" --pause uninstall', True),
+    }
+    for fname, (name, exec_, terminal) in entries.items():
+        extra = ("MimeType=application/x-ctr-3dsx;application/x-ctr-cci;application/x-ctr-cia;"
+                 "application/x-ctr-cxi;\n") if not terminal else ""
+        (LINUX_APPS / fname).write_text(
+            f"[Desktop Entry]\nType=Application\nName={name}\nExec={exec_}\n"
+            f"Terminal={'true' if terminal else 'false'}\nCategories=Game;Emulator;\n{extra}")
+
+
+def applescript_str(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def start_watcher_at_login(me):
@@ -572,11 +868,10 @@ def start_watcher_at_login(me):
         stop_watcher()
         subprocess.run(["launchctl", "bootstrap", domain, str(LAUNCH_AGENT)], check=True)
         return
-    autostart = XDG_CONFIG / "autostart"
-    autostart.mkdir(parents=True, exist_ok=True)
-    (autostart / "3ds-setup-watch.desktop").write_text(
+    LINUX_AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+    LINUX_AUTOSTART.write_text(
         "[Desktop Entry]\nType=Application\nName=3DS save backups\n"
-        f"Exec={sys.executable} {me} watch\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n")
+        f'Exec="{sys.executable}" "{me}" watch\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n')
     stop_watcher()
     subprocess.Popen([sys.executable, str(me), "watch"], start_new_session=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -591,14 +886,35 @@ def stop_watcher():
         pass
 
 
+def install_titles():
+    here = Path(__file__).resolve().parent
+    for local in (here / "titles.json", here.parent / "titles.json"):
+        if local.exists() and local.resolve() != TITLES_PATH.resolve():
+            shutil.copy2(local, TITLES_PATH)
+            return
+    try:
+        download(f"{OUR_RELEASE}/titles.json", TITLES_PATH)
+    except Exception as e:  # names are a nicety; never fail the install over them
+        log(f"couldn't download game names: {e!r}")
+
+
 def cmd_install(args):
     cfg = load_config()
+    first_time = not CONFIG_PATH.exists()
+    interactive = not QUIET and sys.stdin.isatty()
     if args.backup_dir:
         cfg["backup_dir"] = args.backup_dir
-    elif not CONFIG_PATH.exists() and sys.stdin.isatty():
+    elif first_time and interactive:
         cfg["backup_dir"] = choose_backup_dir(cfg["backup_dir"])
     cfg["backup_dir"] = str(Path(cfg["backup_dir"]).expanduser().resolve())
     Path(cfg["backup_dir"]).mkdir(parents=True, exist_ok=True)
+
+    if args.controller:
+        cfg["controller"] = args.controller == "yes"
+    elif "controller" not in cfg:
+        cfg["controller"] = interactive and ask_yes_no(
+            "Will you play with a game controller (Xbox, PlayStation, Switch Pro...)?\n\n"
+            "Pick No to play with the keyboard.", "Controller", "Keyboard")
     save_config(cfg)
 
     tag = download_azahar()
@@ -607,32 +923,71 @@ def cmd_install(args):
     if Path(__file__).resolve() != me.resolve():
         shutil.copy2(__file__, me)
     me.chmod(0o755)
-    bin_link = HOME / ".local/bin/3ds-setup"
-    bin_link.parent.mkdir(parents=True, exist_ok=True)
-    if bin_link.is_symlink() or bin_link.exists():
-        bin_link.unlink()
-    bin_link.symlink_to(me)
+    install_titles()
+    BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+    if BIN_LINK.is_symlink() or BIN_LINK.exists():
+        BIN_LINK.unlink()
+    BIN_LINK.symlink_to(me)
 
-    if not IS_MAC:
-        apps = XDG_DATA / "applications"
-        apps.mkdir(parents=True, exist_ok=True)
-        (apps / "azahar-3ds-setup.desktop").write_text(
-            "[Desktop Entry]\nType=Application\nName=Azahar (3DS)\n"
-            f"Exec={APPIMAGE} %f\nTerminal=false\nCategories=Game;Emulator;\n"
-            "MimeType=application/x-ctr-3dsx;application/x-ctr-cci;application/x-ctr-cia;"
-            "application/x-ctr-cxi;\n")
+    Path(cfg["games_dir"]).mkdir(parents=True, exist_ok=True)
+    if azahar_running():
+        print("(Azahar is open, so its settings were left alone. Re-run install after closing it.)")
+    else:
+        setup_azahar_config(cfg, cfg["controller"])
+    install_helpers(me)
     start_watcher_at_login(me)
 
-    where = "in Applications / Launchpad" if IS_MAC else "menu: 'Azahar (3DS)'"
-    print(f"\nAzahar {tag} installed: {AZAHAR_PATH}  ({where})")
-    print(f"Backups go to {cfg['backup_dir']}/{socket.gethostname()}/")
-    print(f"Watcher running and set to start at login. Settings: {CONFIG_PATH}")
-    print(f"Command: {bin_link}  (e.g. '{bin_link} status')")
+    log(f"installed Azahar {tag}; backups -> {cfg['backup_dir']}")
+    where = "in your Applications folder" if IS_MAC else "in your app menu as 'Azahar (3DS)'"
+    message(f"All set! Azahar is {where}.\n\n"
+            f"Put your 3DS games in the '3DS Games' folder (it opens next), "
+            f"and they'll show up in Azahar.\n\n"
+            f"Your saves back up automatically to:\n{cfg['backup_dir']}")
+    open_folder(cfg["games_dir"])
     if IS_MAC:
         print("For auto save-states, macOS will ask to let python3 control your computer\n"
               "(Accessibility). Allow it in System Settings > Privacy & Security > Accessibility.")
     elif not shutil.which("xdotool"):
         print("Install xdotool for auto save-states:  sudo apt install xdotool")
+
+
+def cmd_uninstall(args):
+    cfg = load_config()
+    data_dir, _ = azahar_dirs()
+    if not args.yes and not ask_yes_no(
+            "Remove Azahar and 3DS Setup from this computer?\n\n"
+            "Your saves and backups are NOT deleted.", "Remove", "Cancel"):
+        return
+    if azahar_running():
+        return message("Please close Azahar first, then try again.")
+    if IS_MAC:
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stop_watcher()
+    for p in (LAUNCH_AGENT, LINUX_AUTOSTART, BIN_LINK, *LINUX_APPS.glob("*3ds-setup*.desktop")):
+        if p.is_symlink() or p.exists():
+            p.unlink()
+    for d in (MAC_APP if IS_MAC else None, MAC_HELPERS if IS_MAC else None):
+        if d and d.exists():
+            shutil.rmtree(d)
+    kept = []
+    if INSTALL_DIR.exists():
+        for p in INSTALL_DIR.iterdir():
+            if p == FALLBACK_DIR:
+                kept.append(p)  # backups that never made it to the backup folder
+            elif p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+    if not IS_MAC and CONFIG_PATH.exists():
+        CONFIG_PATH.unlink()
+        try:
+            CONFIG_PATH.parent.rmdir()
+        except OSError:
+            pass
+    note = f"\nBackups not yet copied to your backup folder: {kept[0]}" if kept else ""
+    message(f"Removed. Your saves are still in:\n{data_dir}\n\nYour backups are in:\n"
+            f"{cfg['backup_dir']}{note}")
 
 
 def cmd_status(args):
@@ -649,28 +1004,51 @@ def cmd_status(args):
     version = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "not installed"
     print(f"Azahar:        {version}  {AZAHAR_PATH}")
     print(f"Azahar data:   {data_dir}")
+    print(f"Games folder:  {cfg['games_dir']}")
     print(f"Backups:       {root}" + ("" if on_target else "   (backup folder missing! using local fallback)"))
-    print(f"Snapshots:     {len(snaps)}" + (f", newest {snaps[0].stem}" if snaps else ""))
+    print(f"Snapshots:     {len(snaps)}" + (f", newest {friendly_time(snaps[0])}" if snaps else ""))
     print(f"Watcher:       {watcher}")
     print(f"Config:        {CONFIG_PATH}")
     print(f"Log:           {LOG_PATH}")
 
 
 def main():
+    global QUIET
     p = argparse.ArgumentParser(prog=APP, description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--quiet", action="store_true", help="no dialogs (for scripts/CI)")
+    p.add_argument("--pause", action="store_true", help="wait for Enter before exiting")
     sub = p.add_subparsers(dest="cmd", required=True)
     i = sub.add_parser("install")
     i.add_argument("--backup-dir")
+    i.add_argument("--controller", choices=["yes", "no"], help="set Azahar up for a game controller")
     sub.add_parser("watch")
     sub.add_parser("backup")
     r = sub.add_parser("restore")
-    r.add_argument("snapshot", nargs="?", help="number from the list, or a path to a .zip")
+    r.add_argument("snapshot", nargs="?", help="number (newest = 1), or a path to a .zip")
     r.add_argument("--game", help="only restore this title ID (full 16 hex or last 8)")
     sub.add_parser("status")
-    args = p.parse_args()
-    {"install": cmd_install, "watch": cmd_watch, "backup": cmd_backup,
-     "restore": cmd_restore, "status": cmd_status}[args.cmd](args)
+    u = sub.add_parser("uninstall")
+    u.add_argument("--yes", action="store_true", help="don't ask for confirmation")
+    argv = sys.argv[1:]
+    flags = [a for a in argv if a in ("--quiet", "--pause")]  # allowed before or after the command
+    args = p.parse_args(flags + [a for a in argv if a not in flags])
+    QUIET = args.quiet or bool(os.environ.get("CI"))
+    commands = {"install": cmd_install, "watch": cmd_watch, "backup": cmd_backup,
+                "restore": cmd_restore, "status": cmd_status, "uninstall": cmd_uninstall}
+    try:
+        commands[args.cmd](args)
+    except KeyboardInterrupt:
+        sys.exit(1)
+    except Exception as e:
+        if args.cmd == "watch":
+            raise
+        log(f"ERROR in {args.cmd}: {e!r}")
+        message(f"Something went wrong: {e}\n\nDetails are in {LOG_PATH}")
+        sys.exit(1)
+    finally:
+        if args.pause and not QUIET:  # menu shortcuts open a terminal that would otherwise vanish
+            input("\nPress Enter to close. ")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 <#
 3ds-setup (Windows): install Azahar (3DS emulator) and keep your saves backed up.
 
-  install   download/update Azahar, pick a backup folder, start the background watcher
-  watch     background loop: while Azahar runs, back up saves and auto save-state
-  backup    back up right now
-  restore   pick a save snapshot to restore (optionally just one game)
-  status    show where everything is
+  install    download/update Azahar, pick a backup folder, start the background watcher
+  watch      background loop: while Azahar runs, back up saves and auto save-state
+  backup     back up right now
+  restore    pick a backup to bring back (or: restore <number> -Game <ID>)
+  status     show where everything is
+  uninstall  remove Azahar and 3ds-setup (saves and backups are kept)
 
 Works on the PowerShell 5.1 that ships with Windows; nothing else to install.
 #>
@@ -14,8 +15,12 @@ param(
     [Parameter(Position = 1)][string]$Snapshot,
     [string]$Game,
     [string]$BackupDir,
+    [ValidateSet('', 'yes', 'no')][string]$Controller = '',
+    [switch]$Quiet,  # no dialogs (for scripts/CI)
+    [switch]$Yes,    # uninstall without asking
     [switch]$Pause
 )
+if ($env:CI) { $Quiet = $true }
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # Invoke-WebRequest is very slow with the progress bar
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -23,19 +28,29 @@ Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 
 $App = '3ds-setup'
 $ReleaseApi = 'https://api.github.com/repos/azahar-emu/azahar/releases/latest'
+$OurRelease = 'https://github.com/erickfm/3ds-setup/releases/latest/download'
 $InstallDir = "$env:LOCALAPPDATA\$App"
 $AzaharDir = "$env:LOCALAPPDATA\Programs\Azahar"
 $AzaharExe = "$AzaharDir\azahar.exe"
 $VersionFile = "$AzaharDir\3ds-setup-version.txt"
 $ConfigPath = "$env:APPDATA\$App\config.json"
 $LogPath = "$InstallDir\3ds-setup.log"
+$TitlesPath = "$InstallDir\titles.json"
+$UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\3ds-setup'
 # Used when the backup folder is missing (e.g. external drive unplugged); moved over once it's back.
 $FallbackDir = "$InstallDir\pending-backups"
 $Host_ = $env:COMPUTERNAME
 $TickSeconds = 15
 
+function Get-KnownFolder($name, $fallback) {
+    $path = [Environment]::GetFolderPath($name)
+    if ($path) { return $path }
+    return (Join-Path $env:USERPROFILE $fallback)
+}
+
 $Defaults = [ordered]@{
     backup_dir                   = "$env:USERPROFILE\3DS-Backups"
+    games_dir                    = (Join-Path (Get-KnownFolder 'MyDocuments' 'Documents') '3DS Games')
     backup_every_minutes         = 5
     autosave_state_every_minutes = 10       # 0 turns auto save-states off
     autosave_hotkey              = 'ctrl+c' # Azahar default for "Save to Oldest Non-Quicksave Slot"
@@ -378,14 +393,205 @@ function Invoke-Watch {
     }
 }
 
+# ---------------------------------------------------------------- dialogs
+# Everything a normal person sees is a regular Windows dialog, not the console.
+
+function Get-TopWindow {
+    Add-Type -AssemblyName System.Windows.Forms
+    return (New-Object System.Windows.Forms.Form -Property @{ TopMost = $true })
+}
+
+function Show-Message($text, [switch]$Warning) {
+    if ($Quiet) { Write-Host $text; return }
+    Add-Type -AssemblyName System.Windows.Forms
+    $icon = if ($Warning) { 'Warning' } else { 'Information' }
+    [void][System.Windows.Forms.MessageBox]::Show((Get-TopWindow), $text, '3DS Setup', 'OK', $icon)
+}
+
+function Confirm-Choice($question) {
+    Add-Type -AssemblyName System.Windows.Forms
+    return [System.Windows.Forms.MessageBox]::Show((Get-TopWindow), $question, '3DS Setup', 'YesNo', 'Question') -eq 'Yes'
+}
+
+function Select-Item($title, $items) {
+    # A clickable list; falls back to typing a number if Out-GridView isn't available.
+    try {
+        return $items | Out-GridView -Title $title -OutputMode Single
+    } catch {
+        Write-Host "`n$title"
+        $i = 1
+        foreach ($item in $items) { Write-Host ("  {0}. {1}" -f $i, (($item.PSObject.Properties | ForEach-Object { $_.Value }) -join '  ')); $i++ }
+        $n = Read-Host 'Number (blank = cancel)'
+        if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le @($items).Count) { return @($items)[[int]$n - 1] }
+        return $null
+    }
+}
+
+# ---------------------------------------------------------------- game names and dates
+
+$script:Titles = $null
+function Get-GameName($tid) {
+    if ($null -eq $script:Titles) {
+        $script:Titles = @{}
+        try {
+            (Get-Content -LiteralPath $TitlesPath -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties |
+                ForEach-Object { $script:Titles[$_.Name] = $_.Value }
+        } catch {}
+    }
+    if ($script:Titles.ContainsKey($tid)) { return $script:Titles[$tid] }
+    if ($tid.StartsWith('00000000')) { return "Extra data $($tid.Substring(8))" }
+    return "Unknown game ($tid)"
+}
+
+function Get-GameKeys($names) {
+    # Map each save file to its game; a game's extra data (extdata) is filed under the game itself.
+    $byUniqueId = @{}
+    foreach ($n in $names) {
+        $t = Get-TitleOf $n
+        if ($t -and $n.Split('/')[4] -eq 'title') { $byUniqueId[([Convert]::ToInt64($t.Substring(8), 16) -shr 8) -band 0xFFFFF] = $t }
+    }
+    $keys = @{}
+    foreach ($n in $names) {
+        $t = Get-TitleOf $n
+        if ($t -and $n.Split('/')[4] -eq 'extdata') {
+            $uid = [Convert]::ToInt64($t.Substring(8), 16)
+            if ($byUniqueId.ContainsKey($uid)) { $t = $byUniqueId[$uid] }
+        }
+        $keys[$n] = $t
+    }
+    return $keys
+}
+
+function Get-SnapshotGames($path) {
+    $zip = [IO.Compression.ZipFile]::OpenRead($path)
+    try { $names = @($zip.Entries | ForEach-Object { $_.FullName } | Where-Object { -not $_.StartsWith('config/') }) } finally { $zip.Dispose() }
+    $keys = Get-GameKeys $names
+    return @($keys.Values | Where-Object { $_ } | Sort-Object -Unique | Sort-Object { Get-GameName $_ })
+}
+
+function Format-When($snapshot) {
+    # 'Today 7:30 PM' / 'Yesterday 9:05 AM' / 'Thu Oct 23, 7:30 PM'
+    $name = Split-Path $snapshot -Leaf
+    $when = [datetime]::ParseExact($name.Substring(0, 19), 'yyyy-MM-dd_HH-mm-ss', [Globalization.CultureInfo]::InvariantCulture)
+    $clock = $when.ToShortTimeString()
+    $days = ((Get-Date).Date - $when.Date).Days
+    if ($days -eq 0) { return "Today $clock" }
+    if ($days -eq 1) { return "Yesterday $clock" }
+    $year = if ($when.Year -ne (Get-Date).Year) { ", $($when.Year)" } else { '' }
+    return "$($when.ToString('ddd MMM d'))$year, $clock"
+}
+
+# ---------------------------------------------------------------- Azahar settings (qt-config.ini)
+
+function ConvertTo-IniString($value) { return '"' + $value.Replace('\', '\\').Replace('"', '\"') + '"' }
+
+function Get-IniRange($lines, $section) {
+    $start = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].Trim() -eq "[$section]") { $start = $i + 1 }
+        elseif ($start -ge 0 -and $lines[$i].StartsWith('[')) { return @($start, $i) }
+    }
+    if ($start -ge 0) { return @($start, $lines.Count) }
+    return $null
+}
+
+function Get-IniValue($lines, $section, $key) {
+    $r = Get-IniRange $lines $section
+    if ($r) { for ($i = $r[0]; $i -lt $r[1]; $i++) { if ($lines[$i].StartsWith("$key=")) { return $lines[$i].Substring($key.Length + 1).Trim() } } }
+    return $null
+}
+
+function Set-IniValues([System.Collections.Generic.List[string]]$lines, $section, $items) {
+    $r = Get-IniRange $lines $section
+    if (-not $r) { $lines.Add(''); $lines.Add("[$section]"); $r = @($lines.Count, $lines.Count) }
+    $start = $r[0]; $end = $r[1]
+    foreach ($key in $items.Keys) {
+        # drop the old value and any "use default" flag
+        for ($i = $end - 1; $i -ge $start; $i--) {
+            if ($lines[$i].StartsWith("$key=") -or $lines[$i].StartsWith("$key\default=")) { $lines.RemoveAt($i); $end-- }
+        }
+        while ($end -gt $start -and -not $lines[$end - 1].Trim()) { $end-- }  # before the blank line ending the section
+        $lines.Insert($end, "$key=$($items[$key])"); $end++
+    }
+}
+
+# Azahar's own controller Auto-Map: buttons by position, like a real 3DS (SDL button numbers).
+$ControllerButtons = [ordered]@{
+    button_a = @(1, 'B'); button_b = @(0, 'A'); button_x = @(3, 'Y'); button_y = @(2, 'X')
+    button_up = @(11, 'D-Pad Up'); button_down = @(12, 'D-Pad Down'); button_left = @(13, 'D-Pad Left'); button_right = @(14, 'D-Pad Right')
+    button_l = @(9, 'LB'); button_r = @(10, 'RB'); button_start = @(6, 'Start'); button_select = @(4, 'Back'); button_home = @(5, 'Guide')
+}
+
+function Get-ControllerProfile {
+    # maptype:all = whichever controller is plugged in, no device ID needed.
+    $common = 'api:controller,engine:sdl,guid:0,maptype:all,port:0'
+    $p = [ordered]@{ 'profiles\1\name' = 'Default'; 'profiles\1\input_maptype' = '0' }
+    foreach ($k in $ControllerButtons.Keys) {
+        $p["profiles\1\$k"] = ConvertTo-IniString "$common,button:$($ControllerButtons[$k][0]),name:$($ControllerButtons[$k][1])"
+    }
+    $p['profiles\1\button_zl'] = ConvertTo-IniString "$common,axis:4,direction:+,name:Left Trigger,threshold:0.500000"
+    $p['profiles\1\button_zr'] = ConvertTo-IniString "$common,axis:5,direction:+,name:Right Trigger,threshold:0.500000"
+    $p['profiles\1\circle_pad'] = ConvertTo-IniString "$common,axis_x:0,axis_y:1,name_x:Left Stick X,name_y:Left Stick Y"
+    $p['profiles\1\c_stick'] = ConvertTo-IniString "$common,axis_x:2,axis_y:3,name_x:Right Stick X,name_y:Right Stick Y"
+    $p['profiles\size'] = '1'
+    $p['profile'] = '0'
+    return $p
+}
+
+function Set-AzaharConfig($cfg, [bool]$useController) {
+    # Point Azahar's game list at the games folder, and (fresh setups only) map a controller.
+    $ini = Join-Path (Get-AzaharUserDir) 'config\qt-config.ini'
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    if (Test-Path -LiteralPath $ini) { foreach ($l in [IO.File]::ReadAllLines($ini)) { $lines.Add($l) } }
+    $changed = $false
+
+    $games = $cfg.games_dir.Replace('\', '/')
+    $size = [int](Get-IniValue $lines 'UI' 'Paths\gamedirs\size')
+    $existing = @(for ($i = 1; $i -le $size; $i++) { "$(Get-IniValue $lines 'UI' "Paths\gamedirs\$i\path")".Trim('"') })
+    if ($existing -notcontains $games) {
+        $items = [ordered]@{}
+        if ($size -eq 0) {  # Azahar only adds these when the list is empty; keep them
+            $i = 1
+            foreach ($special in 'INSTALLED', 'SYSTEM') {
+                $items["Paths\gamedirs\$i\path"] = $special; $items["Paths\gamedirs\$i\deep_scan"] = 'false'; $items["Paths\gamedirs\$i\expanded"] = 'true'; $i++
+            }
+            $size = 2
+        }
+        $size++
+        $items["Paths\gamedirs\$size\path"] = ConvertTo-IniString $games
+        $items["Paths\gamedirs\$size\deep_scan"] = 'true'
+        $items["Paths\gamedirs\$size\expanded"] = 'true'
+        $items['Paths\gamedirs\size'] = "$size"
+        Set-IniValues $lines 'UI' $items
+        $changed = $true
+    }
+    # Never replace a mapping someone already set up.
+    if ($useController -and $null -eq (Get-IniValue $lines 'Controls' 'profiles\size')) {
+        Set-IniValues $lines 'Controls' (Get-ControllerProfile)
+        $changed = $true
+    }
+    if ($changed) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $ini) | Out-Null
+        [IO.File]::WriteAllText("$ini.partial", (($lines -join "`n").Trim("`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath "$ini.partial" -Destination $ini -Force
+    }
+}
+
+# ---------------------------------------------------------------- commands
+
 function Invoke-Backup {
     $cfg = Get-Config
     Move-Fallback $cfg
     $snap = Backup-Saves $cfg -Force
     Backup-States $cfg
     $root = Get-BackupRoot $cfg
-    if (-not $root.OnTarget) { Write-Host "NOTE: $($cfg.backup_dir) isn't available, backed up to $($root.Path) instead" -ForegroundColor Yellow }
-    if ($snap) { Write-Host "Done! Saved to $snap" -ForegroundColor Green }
+    if (-not $root.OnTarget) {
+        Show-Message "Your backup folder ($($cfg.backup_dir)) isn't available, so this backup was kept on this computer for now. It moves over once the folder is back." -Warning
+    } elseif ($snap) {
+        Show-Message 'Backed up! Your saves are safe.'
+    } else {
+        Show-Message 'There are no saves to back up yet. Play a game and save first.'
+    }
 }
 
 function Get-Snapshots($cfg) {
@@ -398,38 +604,51 @@ function Get-Snapshots($cfg) {
 function Invoke-Restore {
     $cfg = Get-Config
     $snaps = Get-Snapshots $cfg
-    if (-not $snaps.Count) { Write-Host 'No snapshots found.'; return }
-    $pick = $Snapshot
-    if (-not $pick) {
-        $i = 1
-        foreach ($s in $snaps | Select-Object -First 30) {
-            $zip = [IO.Compression.ZipFile]::OpenRead($s.FullName)
-            try { $titles = @($zip.Entries | ForEach-Object { Get-TitleOf $_.FullName } | Where-Object { $_ } | Sort-Object -Unique) } finally { $zip.Dispose() }
-            Write-Host ('{0,3}  {1}   games: {2}' -f $i, $s.BaseName, ($titles -join ', '))
+    if (-not $snaps.Count) { Show-Message 'There are no backups yet.'; return }
+    $gameId = if ($Game) { $Game.ToUpper() } else { $null }
+
+    if (-not $Snapshot) {
+        $rows = @()
+        $i = 0
+        foreach ($s in $snaps | Select-Object -First 50) {
+            $names = @(Get-SnapshotGames $s.FullName | ForEach-Object { Get-GameName $_ })
+            $rows += [pscustomobject]@{ Backup = (Format-When $s.Name); Games = $(if ($names) { $names -join ', ' } else { 'system data' }); '#' = $i }
             $i++
         }
-        $pick = Read-Host "`nWhich snapshot number? (blank = cancel)"
-        if (-not $pick) { return }
-        if (-not $Game) { $Game = Read-Host 'Only one game? Type its ID from the list (blank = restore all games)' }
-    }
-    if ($pick -match '^\d+$') {
-        if ([int]$pick -lt 1 -or [int]$pick -gt $snaps.Count) { throw "pick a number from 1 to $($snaps.Count)" }
-        $snap = $snaps[[int]$pick - 1].FullName
+        $row = Select-Item 'Which backup do you want to go back to? (newest first) - click one, then OK' $rows
+        if (-not $row) { return }
+        $snap = $snaps[$row.'#'].FullName
+        $games = @(Get-SnapshotGames $snap)
+        if ($games.Count -gt 1) {
+            $choices = @([pscustomobject]@{ Game = 'All games'; '#' = -1 })
+            for ($j = 0; $j -lt $games.Count; $j++) { $choices += [pscustomobject]@{ Game = (Get-GameName $games[$j]); '#' = $j } }
+            $c = Select-Item 'Restore which game? - click one, then OK' $choices
+            if (-not $c) { return }
+            if ($c.'#' -ge 0) { $gameId = $games[$c.'#'] }
+        } elseif ($games.Count -eq 1) {
+            $gameId = $games[0]
+        }
+        $what = if ($gameId) { Get-GameName $gameId } else { 'all your games' }
+        $when = Format-When $snap
+        if ($when -notmatch '^(Today|Yesterday)') { $when = "on $when" } else { $when = $when.Substring(0, 1).ToLower() + $when.Substring(1) }
+        if (-not (Confirm-Choice "Put $what back to how it was $when?`n`nYour current save is backed up first, so you can undo this.")) { return }
+    } elseif ($Snapshot -match '^\d+$') {
+        if ([int]$Snapshot -lt 1 -or [int]$Snapshot -gt $snaps.Count) { throw "pick a number from 1 to $($snaps.Count)" }
+        $snap = $snaps[[int]$Snapshot - 1].FullName
     } else {
-        $snap = $pick
+        $snap = $Snapshot
     }
-    if (Test-AzaharRunning) { throw 'Close Azahar first, then restore.' }
+    if (Test-AzaharRunning) { Show-Message 'Please close Azahar first, then try again.' -Warning; return }
 
     $root = Get-AzaharUserDir
     $zip = [IO.Compression.ZipFile]::OpenRead($snap)
     try {
         $entries = @($zip.Entries | Where-Object { -not $_.FullName.StartsWith('config/') -and -not $_.FullName.EndsWith('/') })
-        if ($Game) {
-            $g = $Game.ToUpper()
-            $entries = @($entries | Where-Object { $t = Get-TitleOf $_.FullName; $t -and $t.EndsWith($g) })
-            if (-not $entries.Count) { throw "$(Split-Path $snap -Leaf) has no save for $g" }
+        if ($gameId) {
+            $keys = Get-GameKeys @($entries | ForEach-Object { $_.FullName })
+            $entries = @($entries | Where-Object { $k = $keys[$_.FullName]; $k -and $k.EndsWith($gameId) })
+            if (-not $entries.Count) { throw "$(Split-Path $snap -Leaf) has no save for $gameId" }
         }
-        Write-Host 'Backing up current saves first (so this can be undone)...'
         $before = Backup-Saves $cfg -Force -NoPrune  # don't prune what we're restoring
 
         $containers = @($entries | ForEach-Object { Get-SaveContainer $_.FullName } | Where-Object { $_ } | Sort-Object -Unique)
@@ -445,8 +664,9 @@ function Invoke-Restore {
             [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
         }
     } finally { $zip.Dispose() }
-    Write-Host "Restored $($entries.Count) files from $(Split-Path $snap -Leaf)" -ForegroundColor Green
-    if ($before) { Write-Host "Your previous saves are in $before" }
+    Log "restored $($entries.Count) files from $(Split-Path $snap -Leaf)$(if ($gameId) { " (game $gameId)" })"
+    $undo = if ($before) { "`n`nChanged your mind? Restore the backup from $(Format-When $before)." } else { '' }
+    Show-Message "Done! Restored from $(Format-When $snap).$undo"
 }
 
 function Install-Azahar {
@@ -456,7 +676,7 @@ function Install-Azahar {
         Write-Host "Azahar $tag already installed"
         return $tag
     }
-    if (Test-AzaharRunning) { throw 'Close Azahar first so it can be updated.' }
+    if (Test-AzaharRunning) { throw 'Please close Azahar first so it can be updated.' }
     $asset = $release.assets | Where-Object { $_.name -like 'azahar-windows-msvc-*.zip' } | Select-Object -First 1
     $tmp = Join-Path $env:TEMP "$App-$([guid]::NewGuid())"
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
@@ -466,7 +686,7 @@ function Install-Azahar {
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing -Headers @{ 'User-Agent' = $App }
         if ($asset.digest) {
             $expected = $asset.digest -replace '^sha256:', ''
-            if ((Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash -ne $expected) { throw 'download checksum mismatch, aborting' }
+            if ((Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash -ne $expected) { throw 'The Azahar download was corrupted. Please try again.' }
         }
         $extracted = Join-Path $tmp 'x'
         [IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extracted)
@@ -493,27 +713,38 @@ function Install-VcRuntime {
     Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
 }
 
+function Install-Titles {
+    $here = Split-Path $PSCommandPath
+    foreach ($local in (Join-Path $here 'titles.json'), (Join-Path (Split-Path $here) 'titles.json')) {
+        if ((Test-Path -LiteralPath $local) -and ([IO.Path]::GetFullPath($local) -ne [IO.Path]::GetFullPath($TitlesPath))) {
+            Copy-Item -LiteralPath $local -Destination $TitlesPath -Force; return
+        }
+    }
+    try {
+        Invoke-WebRequest -Uri "$OurRelease/titles.json" -OutFile "$TitlesPath.partial" -UseBasicParsing -Headers @{ 'User-Agent' = $App }
+        Move-Item -LiteralPath "$TitlesPath.partial" -Destination $TitlesPath -Force
+    } catch { Log "couldn't download game names: $_" }  # names are a nicety; never fail the install
+}
+
 function Select-BackupFolder($default) {
     Write-Host "`nChoose where backups go: an external drive or a synced folder (OneDrive, Dropbox...)."
     try {
         Add-Type -AssemblyName System.Windows.Forms
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dlg.Description = 'Where should 3DS save backups go? (external drive or OneDrive/Dropbox folder)'
+        $dlg.Description = "Where should your 3DS save backups go?`nAn external drive, or a folder that syncs (OneDrive, Dropbox), is safest."
         $dlg.ShowNewFolderButton = $true
-        $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
-        if ($dlg.ShowDialog($owner) -eq 'OK') { return (Join-Path $dlg.SelectedPath '3DS-Backups') }
+        if ($dlg.ShowDialog((Get-TopWindow)) -eq 'OK') { return (Join-Path $dlg.SelectedPath '3DS-Backups') }
     } catch {}
-    $answer = Read-Host "Backup folder [$default]"
-    if ($answer) { return $answer }
     return $default
 }
 
-function New-Shortcut($path, $target, $arguments, $workdir, [int]$window = 1) {
+function New-Shortcut($path, $target, $arguments, $workdir, [int]$window = 1, $icon) {
     New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
     $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
     $s.TargetPath = $target
     if ($arguments) { $s.Arguments = $arguments }
     if ($workdir) { $s.WorkingDirectory = $workdir }
+    if ($icon) { $s.IconLocation = $icon }
     $s.WindowStyle = $window
     $s.Save()
 }
@@ -524,12 +755,21 @@ function Stop-Watcher {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
+$StartMenu = Join-Path (Get-KnownFolder 'Programs' 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs') '3DS (Azahar)'
+$Desktop = Get-KnownFolder 'Desktop' 'Desktop'
+$StartupLink = Join-Path (Get-KnownFolder 'Startup' 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup') '3DS save backups.lnk'
+
 function Invoke-Install {
     $cfg = Get-Config
+    $firstTime = -not (Test-Path -LiteralPath $ConfigPath)
     if ($BackupDir) { $cfg.backup_dir = $BackupDir }
-    elseif (-not (Test-Path -LiteralPath $ConfigPath)) { $cfg.backup_dir = Select-BackupFolder $cfg.backup_dir }
+    elseif ($firstTime -and -not $Quiet) { $cfg.backup_dir = Select-BackupFolder $cfg.backup_dir }
     New-Item -ItemType Directory -Force -Path $cfg.backup_dir | Out-Null
     $cfg.backup_dir = (Resolve-Path -LiteralPath $cfg.backup_dir).Path
+    if ($Controller) { $cfg.controller = ($Controller -eq 'yes') }
+    elseif (-not $cfg.Contains('controller')) {
+        $cfg.controller = (-not $Quiet) -and (Confirm-Choice "Will you play with a game controller (Xbox, PlayStation, Switch Pro...)?`n`nYes = controller`nNo = keyboard")
+    }
     Save-Config $cfg
 
     Install-VcRuntime
@@ -539,27 +779,68 @@ function Invoke-Install {
     $me = Join-Path $InstallDir '3ds-setup.ps1'
     if ($PSCommandPath -ne $me) { Copy-Item -LiteralPath $PSCommandPath -Destination $me -Force }
     Unblock-File -LiteralPath $me
+    Install-Titles
+
+    New-Item -ItemType Directory -Force -Path $cfg.games_dir | Out-Null
+    if (Test-AzaharRunning) { Write-Host '(Azahar is open, so its settings were left alone. Run Update Azahar after closing it.)' }
+    else { Set-AzaharConfig $cfg ([bool]$cfg.controller) }
 
     $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $run = "-NoProfile -ExecutionPolicy Bypass -File `"$me`""
-    $menu = Join-Path ([Environment]::GetFolderPath('Programs')) '3DS (Azahar)'
-    New-Shortcut (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Azahar (3DS).lnk') $AzaharExe '' $AzaharDir
-    New-Shortcut "$menu\Azahar (3DS).lnk" $AzaharExe '' $AzaharDir
-    New-Shortcut "$menu\Back up 3DS saves now.lnk" $ps "$run backup -Pause"
-    New-Shortcut "$menu\Restore 3DS saves.lnk" $ps "$run restore -Pause"
-    New-Shortcut "$menu\3DS backup status.lnk" $ps "$run status -Pause"
-    New-Shortcut "$menu\Update Azahar.lnk" $ps "$run install -Pause"
-    New-Shortcut "$menu\Open backups folder.lnk" "$env:SystemRoot\explorer.exe" "`"$($cfg.backup_dir)`""
-    New-Shortcut (Join-Path ([Environment]::GetFolderPath('Startup')) '3DS save backups.lnk') $ps "-WindowStyle Hidden $run watch" '' 7
+    $hidden = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$me`""
+    $explorer = "$env:SystemRoot\explorer.exe"
+    $folderIcon = "$env:SystemRoot\System32\shell32.dll,3"
+    New-Shortcut (Join-Path $Desktop 'Azahar (3DS).lnk') $AzaharExe '' $AzaharDir
+    New-Shortcut (Join-Path $Desktop '3DS Games.lnk') $explorer "`"$($cfg.games_dir)`"" '' 1 $folderIcon
+    New-Shortcut "$StartMenu\Azahar (3DS).lnk" $AzaharExe '' $AzaharDir
+    New-Shortcut "$StartMenu\3DS Games folder.lnk" $explorer "`"$($cfg.games_dir)`"" '' 1 $folderIcon
+    New-Shortcut "$StartMenu\Back up 3DS saves now.lnk" $ps "$hidden backup" '' 7 $AzaharExe
+    New-Shortcut "$StartMenu\Restore 3DS saves.lnk" $ps "$hidden restore" '' 7 $AzaharExe
+    New-Shortcut "$StartMenu\Open backups folder.lnk" $explorer "`"$($cfg.backup_dir)`"" '' 1 $folderIcon
+    New-Shortcut "$StartMenu\Update Azahar.lnk" $ps "$run install -Pause" '' 1 $AzaharExe
+    New-Shortcut "$StartMenu\Uninstall 3DS Setup.lnk" $ps "$hidden uninstall" '' 7
+    New-Shortcut $StartupLink $ps "$hidden watch" '' 7
+
+    # Show up in Settings > Apps like a normal program, with a working Uninstall button.
+    New-Item -Path $UninstallKey -Force | Out-Null
+    $props = @{
+        DisplayName = '3DS Setup (Azahar emulator + save backups)'; DisplayVersion = $tag; Publisher = '3ds-setup'
+        DisplayIcon = $AzaharExe; InstallLocation = $AzaharDir; UninstallString = "`"$ps`" $hidden uninstall"
+    }
+    foreach ($k in $props.Keys) { Set-ItemProperty -Path $UninstallKey -Name $k -Value $props[$k] }
+    foreach ($k in 'NoModify', 'NoRepair') { New-ItemProperty -Path $UninstallKey -Name $k -Value 1 -PropertyType DWord -Force | Out-Null }
 
     Stop-Watcher
-    Start-Process -FilePath $ps -ArgumentList "-WindowStyle Hidden $run watch" -WindowStyle Hidden
+    Start-Process -FilePath $ps -ArgumentList "$hidden watch" -WindowStyle Hidden
 
-    Write-Host ''
-    Write-Host "All set! Azahar $tag is installed (Desktop + Start menu: 'Azahar (3DS)')." -ForegroundColor Green
-    Write-Host "Backups go to $($cfg.backup_dir)\$Host_"
-    Write-Host 'The backup watcher is running now and starts with Windows.'
-    Write-Host "Settings: $ConfigPath"
+    Log "installed Azahar $tag; backups -> $($cfg.backup_dir)"
+    Show-Message "All set! Open Azahar from the 'Azahar (3DS)' icon on your Desktop.`n`nPut your 3DS games in the '3DS Games' folder (it opens next, and there's a shortcut on your Desktop). They'll show up in Azahar.`n`nYour saves back up automatically to:`n$($cfg.backup_dir)"
+    if (-not $Quiet) { Start-Process -FilePath $explorer -ArgumentList "`"$($cfg.games_dir)`"" }
+}
+
+function Invoke-Uninstall {
+    $cfg = Get-Config
+    if (-not $Yes -and -not (Confirm-Choice "Remove Azahar and 3DS Setup from this computer?`n`nYour saves and backups are NOT deleted.")) { return }
+    if (Test-AzaharRunning) { Show-Message 'Please close Azahar first, then try again.' -Warning; return }
+    $saves = Get-AzaharUserDir
+    Stop-Watcher
+    foreach ($p in $StartupLink, (Join-Path $Desktop 'Azahar (3DS).lnk'), (Join-Path $Desktop '3DS Games.lnk'), $StartMenu, $UninstallKey) {
+        if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
+    }
+    # Program files go; a portable 'user' folder (which holds saves) stays.
+    if (Test-Path -LiteralPath $AzaharDir) {
+        Get-ChildItem -LiteralPath $AzaharDir | Where-Object { $_.Name -ne 'user' } | Remove-Item -Recurse -Force
+        if (-not (Get-ChildItem -LiteralPath $AzaharDir)) { Remove-Item -LiteralPath $AzaharDir -Force }
+    }
+    $kept = $null
+    if (Test-Path -LiteralPath $InstallDir) {
+        Get-ChildItem -LiteralPath $InstallDir | Where-Object { $_.FullName -ne $FallbackDir } | Remove-Item -Recurse -Force
+        if (Test-Path -LiteralPath $FallbackDir) { $kept = $FallbackDir } else { Remove-Item -LiteralPath $InstallDir -Force }
+    }
+    $cfgDir = Split-Path $ConfigPath
+    if (Test-Path -LiteralPath $cfgDir) { Remove-Item -LiteralPath $cfgDir -Recurse -Force }
+    $note = if ($kept) { "`n`nBackups not yet copied to your backup folder: $kept" } else { '' }
+    Show-Message "Removed. Your saves are still in:`n$saves`n`nYour backups are in:`n$($cfg.backup_dir)$note"
 }
 
 function Show-Status {
@@ -570,9 +851,10 @@ function Show-Status {
     $version = if (Test-Path -LiteralPath $VersionFile) { (Get-Content -LiteralPath $VersionFile -Raw).Trim() } else { 'not installed' }
     Write-Host "Azahar:       $version  $AzaharExe"
     Write-Host "Azahar data:  $(Get-AzaharUserDir)"
+    Write-Host "Games folder: $($cfg.games_dir)"
     $warn = if ($root.OnTarget) { '' } else { '   (backup folder missing! using local fallback)' }
     Write-Host "Backups:      $($root.Path)$warn"
-    $newest = if ($snaps.Count) { ", newest $($snaps[0].BaseName)" } else { '' }
+    $newest = if ($snaps.Count) { ", newest $(Format-When $snaps[0].Name)" } else { '' }
     Write-Host "Snapshots:    $($snaps.Count)$newest"
     Write-Host "Watcher:      $(if ($watcher.Count) { 'running' } else { 'NOT running (sign out and back in, or run Update Azahar)' })"
     Write-Host "Config:       $ConfigPath"
@@ -581,16 +863,18 @@ function Show-Status {
 
 try {
     switch ($Command) {
-        'install' { Invoke-Install }
-        'watch'   { Invoke-Watch }
-        'backup'  { Invoke-Backup }
-        'restore' { Invoke-Restore }
-        'status'  { Show-Status }
-        default   { Write-Host 'usage: 3ds-setup.ps1 install|watch|backup|restore|status' }
+        'install'   { Invoke-Install }
+        'watch'     { Invoke-Watch }
+        'backup'    { Invoke-Backup }
+        'restore'   { Invoke-Restore }
+        'status'    { Show-Status }
+        'uninstall' { Invoke-Uninstall }
+        default     { Write-Host 'usage: 3ds-setup.ps1 install|watch|backup|restore|status|uninstall' }
     }
 } catch {
-    Write-Host "ERROR: $_" -ForegroundColor Red
-    if ($Pause) { Read-Host 'Press Enter to close' | Out-Null }
+    Log "ERROR in ${Command}: $_"
+    if ($Command -ne 'watch') { Show-Message "Something went wrong: $_`n`nDetails are in $LogPath" -Warning }
+    if ($Pause -and -not $Quiet) { Read-Host 'Press Enter to close' | Out-Null }
     exit 1
 }
-if ($Pause) { Read-Host 'Press Enter to close' | Out-Null }
+if ($Pause -and -not $Quiet) { Read-Host 'Press Enter to close' | Out-Null }

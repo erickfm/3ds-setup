@@ -1,102 +1,91 @@
-# 3ds-setup
+# 3DS Setup
 
-One-step 3DS setup for **Windows, macOS and Linux**: installs [Azahar](https://azahar-emu.org) (the emulator that replaced Citra), plus a background watcher that makes sure you never lose a save.
+Play 3DS games on your computer without ever losing a save. This installs [Azahar](https://azahar-emu.org) (the 3DS emulator that replaced Citra), sets it up for you, and quietly backs up your saves while you play.
 
-- **Downloads and installs Azahar** (latest release from its GitHub, checksum-verified). Re-run it any time to update.
-- **Backs up your in-game saves** every 5 minutes while Azahar is open, plus when it starts and closes. Each backup is a dated `.zip` snapshot, made only when something actually changed.
-- **Auto save-states** every 10 minutes while you're in a game, and every save state gets archived too.
-- **Restore** any snapshot, for every game or just one. Before restoring, it backs up your current saves, so a restore can always be undone.
-- **External drive unplugged?** Backups go to a local holding folder and move over automatically once the drive is back. You get a notification when that happens.
+Works on **Windows, Mac and Linux**.
 
-## Windows
+## Install
 
-1. Download this repo (green **Code** button → **Download ZIP**) and unzip it.
-2. Open the `windows` folder and double-click **`Install.bat`**.
-   - If Windows says "Windows protected your PC", click **More info → Run anyway**.
-   - A folder picker asks where backups should go. Pick an external drive or your OneDrive/Dropbox folder.
-   - If Windows asks to install the "Microsoft Visual C++ Redistributable", say yes. Azahar needs it.
-3. Done. You'll find these in the Start menu under **3DS (Azahar)**:
+### Windows
 
-   | Shortcut | What it does |
-   |---|---|
-   | Azahar (3DS) | Opens the emulator (also on the Desktop) |
-   | Back up 3DS saves now | Takes an extra backup right away |
-   | Restore 3DS saves | Shows your backups and asks which one to bring back |
-   | Open backups folder | Opens the folder in Explorer |
-   | 3DS backup status | Shows whether everything's working |
-   | Update Azahar | Installs the newest Azahar |
+1. Download **[3DS-Setup-Windows.bat](https://github.com/erickfm/3ds-setup/releases/latest/download/3DS-Setup-Windows.bat)**.
+   - If your browser warns about the file, choose **Keep**. In Edge that's **⋯ → Keep → Show more → Keep anyway**.
+2. Double-click the downloaded file.
+   - If you see a blue "Windows protected your PC" box, click **More info → Run anyway**.
+   - If Windows asks to install the "Microsoft Visual C++ Redistributable", click **Yes**. Azahar needs it.
+3. Answer two quick questions:
+   - **Where should backups go?** Pick an external drive or your OneDrive folder if you have one. Otherwise just click OK.
+   - **Controller or keyboard?**
+4. That's it. You'll have two new icons on your Desktop: **Azahar (3DS)** and **3DS Games**.
 
-The backup watcher starts with Windows on its own. You don't need to do anything.
+### Mac
 
-## macOS
+1. Open **Terminal**: press ⌘ + Space, type `Terminal`, and press Return.
+2. Copy this line, paste it into Terminal, and press Return:
+   ```
+   curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh | sh
+   ```
+3. Answer the same two questions: where backups go, and controller or keyboard.
+4. **Azahar** is now in your Applications folder.
 
-1. Download this repo (green **Code** button → **Download ZIP**). It unzips itself in Downloads.
-2. Open the `mac-linux` folder, **right-click `Install.command` → Open**, then click **Open** again.
-   A plain double-click gets blocked because the script isn't from the App Store.
-   - If a window offers to install "Command Line Tools", click **Install**. Once it's done, open `Install.command` again. This is a one-time step that gives macOS the Python the script uses.
-   - A folder picker asks where backups should go. Pick an external drive or an iCloud/Dropbox folder.
-3. Done. **Azahar** is now in your Applications folder (and in Launchpad), and the backup watcher starts every time you log in.
+The first time an autosave happens, macOS asks whether "python3" may control your computer. Allow it: click **OK**, and when one of the prompts sends you to **System Settings**, switch python3 on there. If you skip this, everything still works except the automatic save states.
 
-Notes:
-- macOS shows "Background Items Added" for the watcher. That's expected.
-- For auto save-states, macOS asks once whether `python3` may control System Events and use **Accessibility**. Allow both: the second one is under System Settings → Privacy & Security → Accessibility. If you skip this, save backups still work.
-- If backups go to an external drive or iCloud folder, macOS might ask whether `python3` may access it. Click **Allow**.
-- On a Mac the autosave hotkey is **⌘C** and loading the newest one is **⌘V**: Azahar turns "Ctrl" shortcuts into ⌘.
+### Linux
 
-Commands work the same as on Linux (below), using `~/.local/bin/3ds-setup`.
-
-## Linux
-
-```sh
-./mac-linux/install.sh                                   # asks where backups go
-./mac-linux/install.sh --backup-dir /media/$USER/MyDrive/3DS-Backups
-```
-
-This adds **Azahar (3DS)** to your app menu and a `3ds-setup` command (in `~/.local/bin`). The watcher also starts on login.
-
-```sh
-3ds-setup status          # is the watcher running, where do backups go
-3ds-setup backup          # back up now
-3ds-setup restore         # list snapshots
-3ds-setup restore 3 --game 00055D00   # restore snapshot #3, only that game
-3ds-setup install         # update Azahar
-```
-
-For auto save-states you need X11 and `xdotool`. On Wayland, save backups still work, but auto save-states are skipped.
-
-## How the auto save-state works
-
-Azahar has no built-in timer for save states. Every 10 minutes the watcher presses Azahar's **"Save to Oldest Slot"** hotkey (`Ctrl+C` by default) for you, but only when an Azahar window with a game loaded is the active window. If you're tabbed out, it waits until you're back.
-
-- To **load the latest autosave**, press `Ctrl+V` ("Load from Newest Slot"), or use *Emulation → Load State*.
-- Autosaves rotate through slots 1–10, so they'll eventually write over states you saved by hand in those slots. Every state still ends up in the backup folder (the last 30 per game), so nothing is really gone. Slot 0 (Quick Save) is never touched.
-- If you've changed that hotkey in Azahar, set `autosave_hotkey` in the config to match.
-
-**In-game saves are your real safety net. Save states are a bonus.** A save state is a snapshot of the whole emulator, so it can stop loading after an Azahar update, and it can also capture a glitched moment. Normal in-game saves keep working across versions and on other devices. Keep saving in-game, and use the snapshots here to undo a bad save.
-
-## Where things go
+Same line as on Mac:
 
 ```
-<backup folder>/<computer name>/
-  saves/2026-10-22_19-30-05.zip     in-game saves + Azahar settings
-  states/<TITLE ID>/<date>_slot03.cst   archived save states
+curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh | sh
 ```
 
-The computer-name subfolder means two PCs can share one cloud folder without overwriting each other's backups.
+## Playing
 
-What's in a save snapshot: each game's save data (`sdmc/.../title/*/*/data`), extra data (`sdmc/.../extdata`), system saves (`nand/data`), and Azahar's config. Game files are never copied, so snapshots stay small.
+- **Put your games in the `3DS Games` folder** (in Documents). Open Azahar and they're in the list; double-click one to play. Azahar needs decrypted game files (`.3ds`, `.cci`, `.cxi`, `.cia`, `.3dsx`, or the compressed `.zcci`/`.zcia`). Dump them from a 3DS you own ([how](https://azahar-emu.org/pages/faq/)).
+- **Controller:** plug it in before you open Azahar. Buttons are laid out like a real 3DS: A is the right face button, B the bottom one.
+- **Saves back up automatically** every few minutes while Azahar is open, and again when you close it.
+- **Save states:** every 10 minutes your game also gets a save state. To jump back to the newest one, press **Ctrl+V** (**⌘V** on a Mac).
 
-Retention: the newest 200 snapshots, **plus the last snapshot of every day, kept forever**. For save states, the last 30 per game.
+## Getting a save back
 
-To use a backed-up save state: copy it into Azahar's `states` folder and rename it to `<TITLE ID>.<slot>.cst`, e.g. `0004000000055D00.05.cst`.
+- **Windows:** Start menu → **3DS (Azahar)** → **Restore 3DS saves**
+- **Mac:** Applications → **3DS Setup** → **Restore 3DS Saves**
+- **Linux:** your app menu → **Restore 3DS saves**
 
-## Settings
+Pick a time from the list, then pick the game. Before restoring, it backs up what you have now, so you can always undo a restore.
 
-The config file lives at `%APPDATA%\3ds-setup\config.json` on Windows, `~/Library/Application Support/3ds-setup/config.json` on macOS, and `~/.config/3ds-setup/config.json` on Linux. The watcher picks up changes without a restart.
+## Uninstalling
+
+- **Windows:** Settings → Apps → **3DS Setup** → Uninstall (or Start menu → 3DS (Azahar) → Uninstall 3DS Setup)
+- **Mac:** Applications → 3DS Setup → **Uninstall 3DS Setup**
+- **Linux:** your app menu → **Uninstall 3DS Setup**
+
+This removes the programs only. **Your saves and backups are never deleted.**
+
+## Good to know
+
+- **Normal in-game saves are the safest.** Save states are a handy extra, but they can stop working after an Azahar update. Keep saving in the game like you normally would.
+- **Backing up to an external drive?** If it's unplugged, backups are kept on the computer and moved over automatically once it's back.
+- **Autosaves rotate through save-state slots 1–10**, so after a while they replace states you saved by hand in those slots. Every one is still kept in your backups folder. The Quick Save slot is never touched.
+
+<details>
+<summary><b>Details for tinkerers</b></summary>
+
+### Where things are
+
+| | Windows | Mac | Linux |
+|---|---|---|---|
+| Azahar | `%LOCALAPPDATA%\Programs\Azahar` | `~/Applications/Azahar.app` | `~/.local/share/3ds-setup/azahar.AppImage` |
+| Settings | `%APPDATA%\3ds-setup\config.json` | `~/Library/Application Support/3ds-setup/config.json` | `~/.config/3ds-setup/config.json` |
+| Log | `%LOCALAPPDATA%\3ds-setup\3ds-setup.log` | `~/Library/Application Support/3ds-setup/3ds-setup.log` | `~/.local/share/3ds-setup/3ds-setup.log` |
+
+Backups are written to `<backup folder>/<computer name>/`: `saves/*.zip` (in-game saves plus Azahar's settings, made only when something changed) and `states/<title ID>/*.cst`. Each snapshot holds every game's save data, extra data and system saves, but never the games themselves, so they stay small. Retention: the newest 200 snapshots plus the last one of every day forever, and 30 save states per game. The computer-name folder lets several PCs share one cloud folder.
+
+### Settings
 
 ```json
 {
   "backup_dir": "D:\\3DS-Backups",
+  "games_dir": "C:\\Users\\you\\Documents\\3DS Games",
   "backup_every_minutes": 5,
   "autosave_state_every_minutes": 10,
   "autosave_hotkey": "ctrl+c",
@@ -105,8 +94,25 @@ The config file lives at `%APPDATA%\3ds-setup\config.json` on Windows, `~/Librar
 }
 ```
 
-Set `autosave_state_every_minutes` to `0` to turn auto save-states off.
+Set `autosave_state_every_minutes` to `0` to turn autosaves off. `autosave_hotkey` must match Azahar's "Save to Oldest Non-Quicksave Slot" hotkey (Ctrl+C by default; on a Mac Qt maps Ctrl to ⌘). The watcher picks up changes within seconds.
 
-## Games
+### How autosave works
 
-Azahar doesn't come with games. Dump the ones you own from your own 3DS (see the [Azahar FAQ](https://azahar-emu.org/pages/faq/)). Azahar needs decrypted dumps (`.3ds`/`.cci`/`.cxi`/`.cia`/`.3dsx`, or its compressed versions like `.zcci`/`.zcia`).
+Azahar has no timer for save states, so the watcher presses that hotkey for you. It only does this when an Azahar window with a game loaded is in front (the title reads `Azahar <version> | <game>`). On Linux this needs X11 and `xdotool`.
+
+### What setup changes in Azahar
+
+It adds the `3DS Games` folder to the game list. If you chose a controller and Azahar has no button mapping yet, it also sets up a controller profile that works with any controller (Azahar's own Auto-Map layout). An existing mapping is never touched.
+
+### Command line
+
+```sh
+3ds-setup status | backup | restore [N --game TITLEID] | install | uninstall      # Mac/Linux (~/.local/bin)
+powershell -File windows\3ds-setup.ps1 status|backup|restore|install|uninstall     # Windows
+```
+
+### Development
+
+Every push runs the installer, a backup/restore and an uninstall on real Windows (PowerShell 5.1), macOS and Linux machines ([`.github/workflows/test.yml`](.github/workflows/test.yml)). Pushing a `v*` tag publishes the release files built by `tools/build-release.py`. Game names come from [3dsdb](https://github.com/hax0kartik/3dsdb) via `tools/update-titles.py`.
+
+</details>

@@ -1,0 +1,193 @@
+# Runs the real installer on real Windows, macOS and Linux machines, then backs up and
+# restores a fake save and uninstalls. On a version tag (v1.2.3) it also publishes the
+# release files people download.
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CI: "true"  # makes the scripts skip every dialog
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: powershell  # Windows PowerShell 5.1, what real users have (not pwsh)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from the single-file download
+        shell: cmd
+        run: |
+          python tools\build-release.py
+          echo.| dist\3DS-Setup-Windows.bat
+          if errorlevel 1 exit /b 1
+          type "%LOCALAPPDATA%\3ds-setup\3ds-setup.log"
+
+      - name: Re-install from the repo with options (also an update)
+        run: |
+          windows\3ds-setup.ps1 install -BackupDir "$env:RUNNER_TEMP\bk" -Controller yes -Quiet
+          if ($LASTEXITCODE) { exit 1 }
+
+      - name: Check what got installed
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Need($cond, $what) { if (-not $cond) { throw "missing: $what" } ; Write-Host "ok: $what" }
+          Need (Test-Path "$env:LOCALAPPDATA\Programs\Azahar\azahar.exe") 'azahar.exe'
+          Need (Test-Path "$env:LOCALAPPDATA\3ds-setup\titles.json") 'titles.json'
+          $desktop = [Environment]::GetFolderPath('Desktop')
+          Need (Test-Path "$desktop\Azahar (3DS).lnk") 'desktop shortcut'
+          Need (Test-Path "$desktop\3DS Games.lnk") 'games folder shortcut'
+          $menu = Join-Path ([Environment]::GetFolderPath('Programs')) '3DS (Azahar)'
+          foreach ($l in 'Restore 3DS saves', 'Back up 3DS saves now', 'Uninstall 3DS Setup') { Need (Test-Path "$menu\$l.lnk") "start menu: $l" }
+          Need (Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) '3DS save backups.lnk')) 'startup entry'
+          Need (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\3ds-setup') 'Apps & features entry'
+          Need (Test-Path (Join-Path ([Environment]::GetFolderPath('MyDocuments')) '3DS Games')) 'games folder'
+          $ini = Get-Content "$env:APPDATA\Azahar\config\qt-config.ini" -Raw
+          Need ($ini -match '3DS Games') 'games folder in Azahar settings'
+          Need ($ini -match 'maptype:all') 'controller preset'
+          Start-Sleep 3
+          $w = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*3ds-setup.ps1*watch*' })
+          Need ($w.Count -eq 1) "exactly one watcher (found $($w.Count))"
+
+      - name: Watcher notices Azahar
+        continue-on-error: true  # Azahar may not start on a GPU-less runner
+        run: |
+          $p = Start-Process "$env:LOCALAPPDATA\Programs\Azahar\azahar.exe" -PassThru
+          Start-Sleep 40
+          Get-Content "$env:LOCALAPPDATA\3ds-setup\3ds-setup.log" -Tail 5
+          $p | Stop-Process -Force
+          if (-not (Select-String -Path "$env:LOCALAPPDATA\3ds-setup\3ds-setup.log" -Pattern 'Azahar started' -Quiet)) { throw 'watcher did not log Azahar starting' }
+
+      - name: Back up, change, restore one game
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Sleep 25  # let the watcher finish its "Azahar closed" backup first
+          $d = "$env:APPDATA\Azahar\sdmc\Nintendo 3DS\0\0"
+          $px = "$d\title\00040000\00055d00\data\1"; $mk = "$d\title\00040000\00030800\data\1"; $ext = "$d\extdata\00000000\0000055d\1"
+          New-Item -ItemType Directory -Force $px, $mk, $ext | Out-Null
+          Set-Content "$px\main" 'px1'; Set-Content "$mk\main" 'mk1'; Set-Content "$ext\e" 'pxe1'
+          windows\3ds-setup.ps1 backup -Quiet; Start-Sleep 2
+          Set-Content "$px\main" 'px2'; Set-Content "$mk\main" 'mk2'; Set-Content "$ext\e" 'pxe2'
+          windows\3ds-setup.ps1 backup -Quiet
+          windows\3ds-setup.ps1 restore 2 -Game 00055D00 -Quiet
+          $got = "$(Get-Content "$px\main") $(Get-Content "$ext\e") $(Get-Content "$mk\main")"
+          Write-Host "after restore: $got"
+          if ($got -ne 'px1 pxe1 mk2') { throw "restore wrong: $got" }
+          windows\3ds-setup.ps1 status
+
+      - name: Uninstall keeps saves and backups
+        run: |
+          $ErrorActionPreference = 'Stop'
+          windows\3ds-setup.ps1 uninstall -Yes -Quiet
+          Start-Sleep 2
+          if (Test-Path "$env:LOCALAPPDATA\Programs\Azahar\azahar.exe") { throw 'azahar.exe still there' }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\3ds-setup') { throw 'Apps entry still there' }
+          if (-not (Test-Path "$env:APPDATA\Azahar\sdmc\Nintendo 3DS\0\0\title\00040000\00055d00\data\1\main")) { throw 'saves were deleted!' }
+          if (-not (Get-ChildItem "$env:RUNNER_TEMP\bk" -Recurse -Filter *.zip)) { throw 'backups were deleted!' }
+          $w = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*3ds-setup.ps1*watch*' })
+          if ($w.Count) { throw 'watcher still running' }
+          Write-Host 'ok: uninstalled, saves and backups kept'
+
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: sh mac-linux/install.sh --backup-dir "$RUNNER_TEMP/bk" --controller yes
+
+      - name: Check what got installed
+        run: |
+          set -e
+          if [ "$(uname)" = Darwin ]; then
+            test -d "$HOME/Applications/Azahar.app" && echo "ok: Azahar.app"
+            test -x "$HOME/Library/Application Support/3ds-setup/python/bin/python3" && echo "ok: bundled python"
+            test -d "$HOME/Applications/3DS Setup/Restore 3DS Saves.app" && echo "ok: restore app"
+            launchctl print "gui/$(id -u)/io.github.erickfm.3ds-setup" >/dev/null && echo "ok: launch agent loaded"
+            codesign --verify --deep "$HOME/Applications/Azahar.app" && echo "ok: Azahar signature intact" || echo "note: Azahar.app signature check failed"
+            INI="$HOME/Library/Application Support/Azahar/config/qt-config.ini"
+          else
+            test -x "$HOME/.local/share/3ds-setup/azahar.AppImage" && echo "ok: AppImage"
+            test -f "$HOME/.local/share/applications/3ds-setup-restore.desktop" && echo "ok: restore menu entry"
+            INI="$HOME/.config/azahar-emu/qt-config.ini"
+          fi
+          test -d "$HOME/Documents/3DS Games" || test -d "$HOME/3DS Games"
+          grep -q '3DS Games' "$INI" && echo "ok: games folder in Azahar settings"
+          grep -q 'maptype:all' "$INI" && echo "ok: controller preset"
+          sleep 3; ~/.local/bin/3ds-setup status
+
+      - name: Watcher notices Azahar (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          open "$HOME/Applications/Azahar.app"; sleep 40
+          tail -5 "$HOME/Library/Application Support/3ds-setup/3ds-setup.log"
+          pkill -x azahar || true
+          grep -q 'Azahar started' "$HOME/Library/Application Support/3ds-setup/3ds-setup.log"
+
+      - name: Back up, change, restore one game
+        run: |
+          set -e
+          sleep 25  # let the watcher finish its "Azahar closed" backup first
+          if [ "$(uname)" = Darwin ]; then U="$HOME/Library/Application Support/Azahar"; else U="$HOME/.local/share/azahar-emu"; fi
+          D="$U/sdmc/Nintendo 3DS/0/0"
+          mkdir -p "$D/title/00040000/00055d00/data/1" "$D/title/00040000/00030800/data/1" "$D/extdata/00000000/0000055d/1"
+          echo px1 > "$D/title/00040000/00055d00/data/1/main"; echo mk1 > "$D/title/00040000/00030800/data/1/main"; echo pxe1 > "$D/extdata/00000000/0000055d/1/e"
+          ~/.local/bin/3ds-setup backup; sleep 2
+          echo px2 > "$D/title/00040000/00055d00/data/1/main"; echo mk2 > "$D/title/00040000/00030800/data/1/main"; echo pxe2 > "$D/extdata/00000000/0000055d/1/e"
+          ~/.local/bin/3ds-setup backup
+          ~/.local/bin/3ds-setup restore 2 --game 00055D00
+          got="$(cat "$D/title/00040000/00055d00/data/1/main") $(cat "$D/extdata/00000000/0000055d/1/e") $(cat "$D/title/00040000/00030800/data/1/main")"
+          echo "after restore: $got"; test "$got" = "px1 pxe1 mk2"
+
+      - name: Uninstall keeps saves and backups
+        run: |
+          set -e
+          ~/.local/bin/3ds-setup uninstall --yes || "$HOME/Library/Application Support/3ds-setup/python/bin/python3" mac-linux/3ds-setup.py uninstall --yes
+          if [ "$(uname)" = Darwin ]; then
+            test ! -e "$HOME/Applications/Azahar.app"
+            if launchctl print "gui/$(id -u)/io.github.erickfm.3ds-setup" >/dev/null 2>&1; then echo "launch agent still loaded"; exit 1; fi
+            U="$HOME/Library/Application Support/Azahar"
+          else
+            test ! -e "$HOME/.local/share/3ds-setup/azahar.AppImage"
+            U="$HOME/.local/share/azahar-emu"
+          fi
+          test -f "$U/sdmc/Nintendo 3DS/0/0/title/00040000/00055d00/data/1/main"
+          ls "$RUNNER_TEMP"/bk/*/saves/*.zip >/dev/null
+          echo "ok: uninstalled, saves and backups kept"
+
+      - name: One-line install from the latest release (curl | sh)
+        run: |
+          if ! curl -sfIL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh >/dev/null; then
+            echo "no release published yet, skipping"; exit 0
+          fi
+          cd "$RUNNER_TEMP"
+          curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh | sh -s -- --backup-dir "$RUNNER_TEMP/bk2" --controller no
+          ~/.local/bin/3ds-setup status
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, unix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/build-release.py
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "3DS Setup $GITHUB_REF_NAME" --notes-file .github/release-notes.md \
+            || gh release upload "$GITHUB_REF_NAME" dist/* --clobber

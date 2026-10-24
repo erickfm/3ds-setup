@@ -62,6 +62,7 @@ jobs:
           Start-Sleep 40
           Get-Content "$env:LOCALAPPDATA\3ds-setup\3ds-setup.log" -Tail 5
           $p | Stop-Process -Force
+          $p.WaitForExit(20000) | Out-Null
           if (-not (Select-String -Path "$env:LOCALAPPDATA\3ds-setup\3ds-setup.log" -Pattern 'Azahar started' -Quiet)) { throw 'watcher did not log Azahar starting' }
 
       - name: Back up, change, restore one game
@@ -133,7 +134,8 @@ jobs:
         run: |
           open "$HOME/Applications/Azahar.app"; sleep 40
           tail -5 "$HOME/Library/Application Support/3ds-setup/3ds-setup.log"
-          pkill -x azahar || true
+          pkill -9 -x azahar || true  # Azahar ignores a polite quit signal
+          for i in $(seq 1 20); do pgrep -x azahar >/dev/null || break; sleep 1; done
           grep -q 'Azahar started' "$HOME/Library/Application Support/3ds-setup/3ds-setup.log"
 
       - name: Back up, change, restore one game

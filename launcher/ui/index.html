@@ -18,12 +18,15 @@
     <symbol id="i-history" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7M4 4.5v4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 8v4.2l2.8 1.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
     <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 4 2.8 19.5h18.4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 10v4.5M12 17.2v.1" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="m6.5 6.5 11 11m0-11-11 11" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 6 8.5 12l6 6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9.5 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-box" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z M4 7.5l8 4.5 8-4.5M12 12v9" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
   </svg>
 
   <main class="console">
     <!-- top screen: the selected game -->
     <section class="screen top" id="top">
+      <div class="backdrop" id="backdrop"></div>
       <header class="statusbar">
         <span class="pill" id="backup-pill"><span class="dot"></span><span id="backup-text">Backups</span></span>
         <span class="spacer"></span>
@@ -39,6 +42,7 @@
     <section class="screen bottom" id="bottom">
       <header class="toolbar">
         <button class="tool add" id="btn-add" title="Add games"><svg><use href="#i-plus"/></svg><span>Add games</span></button>
+        <button class="tool saves" id="btn-saves" title="See all your saves"><svg><use href="#i-history"/></svg><span>Saves</span></button>
         <span class="spacer"></span>
         <button class="tool round" id="btn-folder" title="Open the games folder"><svg><use href="#i-folder"/></svg></button>
         <button class="tool round" id="btn-settings" title="Settings"><svg><use href="#i-gear"/></svg></button>

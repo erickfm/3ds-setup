@@ -46,11 +46,13 @@ Open **3DS**.
 - **Play:** click a game, then **Play** (or double-click it). The game opens in Azahar; close that window to come back. Arrow keys and Enter work too, and so does a controller (D-pad to choose, A to play).
 - **Controller:** plug it in before you start a game. Buttons are laid out like a real 3DS: A is the right face button, B the bottom one.
 - **Saves back up automatically** every few minutes while you play, and again when you stop. Each game shows when it was last saved and whether that save is backed up.
+- **Box art** for each game is downloaded from [GameTDB](https://www.gametdb.com) the first time it's shown.
+- **Dark mode** follows your computer; pick Light or Dark in Settings (the gear) to override it.
 - **Save states:** every 10 minutes your game also gets a save state. To jump back to the newest one, press **Ctrl+V** (**⌘V** on a Mac). You can change or turn this off in Settings (the gear).
 
 ## Getting a save back
 
-In **3DS**, click the game, then **Older saves**. Pick the time you want to go back to. Before going back, it backs up the save you have now, so you can always undo it.
+In **3DS**, click **Saves** to see every game's saves (or pick a game and click **Older saves**). Versions are listed newest first, grouped by day. Pick the one you want to go back to. Before going back, it backs up the save you have now, so you can always undo it.
 
 (Without the app: Start menu → 3DS (Azahar) → Restore 3DS saves on Windows, Applications → 3DS Setup → Restore 3DS Saves on a Mac, or Restore 3DS saves in your Linux app menu.)
 

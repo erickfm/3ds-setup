@@ -13,6 +13,7 @@ let selected = null;   // path of the selected game
 let playing = null;    // name of the game running in Azahar
 let modalOpen = false;
 let onModalClose = null;
+const covers = new Map(); // product code -> box art data: URL, or null if there's none
 
 // ---------------------------------------------------------------- little helpers
 
@@ -24,6 +25,12 @@ const pref = {
     try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private mode etc. */ }
   },
 };
+
+function applyTheme(theme) {
+  if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+  else delete document.documentElement.dataset.theme;
+}
+applyTheme(pref.get("theme", "auto"));
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -117,9 +124,27 @@ async function refresh() {
   playing = lib.playing;
   if (!lib.games.some((g) => g.path === selected)) selected = lib.games[0]?.path ?? null;
   render();
+  loadAllCovers();
 }
 
 const current = () => lib?.games.find((g) => g.path === selected) ?? null;
+
+// Box art comes from the internet the first time, then from a cache on disk.
+async function loadCover(code) {
+  if (!code || covers.has(code)) return covers.get(code) ?? null;
+  covers.set(code, null);
+  let url = null;
+  try { url = await invoke("cover", { code }); } catch { /* offline etc. */ }
+  covers.set(code, url);
+  if (url && current()?.product_code === code && !playing) renderStage(true);
+  return url;
+}
+
+async function loadAllCovers() {
+  const g = current();
+  if (g) await loadCover(g.product_code);
+  for (const game of lib.games) await loadCover(game.product_code);
+}
 
 // ---------------------------------------------------------------- rendering
 
@@ -142,12 +167,22 @@ function renderStatus() {
   pill.title = "Backup settings";
 }
 
-function renderStage() {
+function setBackdrop(url) {
+  const b = $("backdrop");
+  if (url) b.style.backgroundImage = `url("${url}")`;
+  b.classList.toggle("on", !!url);
+}
+
+function renderStage(quiet) {
   const stage = $("stage");
   const g = current();
-  stage.style.animation = "none";
-  void stage.offsetWidth; // restart the little entrance animation
-  stage.style.animation = "";
+  if (!quiet) {
+    stage.style.animation = "none";
+    void stage.offsetWidth; // restart the little entrance animation
+    stage.style.animation = "";
+  }
+  const box = g && covers.get(g.product_code);
+  setBackdrop(!playing && box);
 
   if (!lib.azahar_ready) {
     stage.innerHTML = `<div class="center-card"><h1>Almost there</h1>
@@ -189,8 +224,11 @@ function renderStage() {
     note = `<div class="note info">${icon("box")}<span>The first time you play, this game gets set up inside Azahar. It takes a moment.</span></div>`;
   }
 
+  const picture = box
+    ? `<div class="boxart" style="background-image:url('${box}')"><div class="badge-icon">${art(g)}</div></div>`
+    : `<div class="banner-icon">${art(g)}</div>`;
   stage.innerHTML = `
-    <div class="banner-icon">${art(g)}</div>
+    ${picture}
     <div class="banner-text">
       <h1>${esc(g.name)}</h1>
       ${g.publisher ? `<p class="publisher">${esc(g.publisher)}</p>` : ""}
@@ -202,7 +240,7 @@ function renderStage() {
       ${note}
     </div>`;
   $("btn-play").onclick = () => play(g);
-  if (g.title_id) $("btn-history").onclick = () => showVersions(g);
+  if (g.title_id) $("btn-history").onclick = () => showVersions(g, false);
 }
 
 function renderGrid() {
@@ -306,11 +344,67 @@ async function addGames(files) {
   if (lines.length) showMessage("Some files weren't added", lines.map((l) => `<p>${l}</p>`).join(""), true);
 }
 
-async function showVersions(g) {
+function saveStatus(g) {
+  if (g.backed_up === true) return { cls: "ok", text: "Backed up" };
+  if (g.backed_up === false) return { cls: "wait", text: "Backing up soon" };
+  return { cls: "", text: "No save yet" };
+}
+
+function showSavesList() {
   sound("open");
-  const head = `<div class="modal-head"><span class="mini">${art(g)}</span><h2>Older saves</h2>
+  const games = lib.games.filter((g) => g.title_id);
+  games.sort((a, b) => (b.last_saved ?? 0) - (a.last_saved ?? 0));
+  const b = lib.backup;
+  const rows = games.map((g, i) => {
+    const st = saveStatus(g);
+    const saved = g.last_saved ? `Saved ${ago(new Date(g.last_saved))}` : "Not played yet";
+    return `<div class="row game-row" data-g="${i}" role="button" tabindex="0">
+      <span class="mini">${art(g)}</span>
+      <span class="when">${esc(g.name)}<span class="sub"><span class="status-dot ${st.cls}"></span>${st.text} · ${saved}</span></span>
+      <span class="chev">${icon("chev")}</span></div>`;
+  });
+  openModal(`<div class="modal-head"><h2>Your saves</h2><button class="x" data-close title="Close">${icon("close")}</button></div>
+    <div class="modal-body">
+      <div class="summary">
+        <span class="chip ${b.on_target ? "ok" : "bad"}">${icon(b.on_target ? "check" : "warn")}${b.last ? `Last backup ${ago(stampDate(b.last))}` : "No backups yet"}</span>
+        <span class="chip">${icon("save")}${b.count} backup${b.count === 1 ? "" : "s"} kept</span>
+      </div>
+      ${rows.length ? `<p>Pick a game to see every version of its save, and go back to any of them.</p><div class="rows">${rows.join("")}</div>`
+        : `<div class="empty">No games with saves yet.<br>Play something and it shows up here.</div>`}
+    </div>
+    <div class="modal-foot"><button class="btn" id="saves-open">${icon("folder")} Open backups folder</button><button class="btn" id="saves-now">Back up now</button></div>`);
+  $("modal-body").querySelectorAll("[data-g]").forEach((el) => {
+    const open = () => showVersions(games[+el.dataset.g], true);
+    el.onclick = open;
+    el.onkeydown = (e) => e.key === "Enter" && open();
+  });
+  $("saves-open").onclick = () => invoke("open_folder", { which: "backups" });
+  $("saves-now").onclick = async (ev) => {
+    ev.currentTarget.disabled = true;
+    try { await invoke("backup_now"); sound("done"); toast("Backed up! Your saves are safe."); }
+    catch (e) { toast(`Backup failed: ${e}`, 5000); }
+    await refresh();
+    if (modalOpen) showSavesList();
+  };
+}
+
+function dayLabel(d) {
+  const days = Math.round((dayStart(new Date()) - dayStart(d)) / 864e5);
+  if (days === 0) return "Today";
+  if (days === 1) return "Yesterday";
+  const opts = { weekday: "long", month: "long", day: "numeric" };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = "numeric";
+  return d.toLocaleDateString([], opts);
+}
+
+async function showVersions(g, fromList) {
+  sound("open");
+  const lead = fromList ? `<button class="back" id="v-back" title="All saves">${icon("back")}</button>` : "";
+  const head = `<div class="modal-head">${lead}<span class="mini">${art(g)}</span><h2>${esc(g.name)}</h2>
     <button class="x" data-close title="Close">${icon("close")}</button></div>`;
+  const wireBack = () => { if (fromList) $("v-back").onclick = showSavesList; };
   openModal(`${head}<div class="modal-body"><div class="spinner"></div></div>`);
+  wireBack();
   let versions;
   try {
     versions = await invoke("save_versions", { titleId: g.title_id });
@@ -320,16 +414,27 @@ async function showVersions(g) {
   if (!modalOpen) return;
   if (!versions.length) {
     $("modal-body").innerHTML = `${head}<div class="modal-body"><div class="empty">No backups of ${esc(g.name)} yet.<br>They're made automatically while you play.</div></div>`;
-    return;
+    $("modal-body").querySelector("[data-close]").onclick = closeModal;
+    return wireBack();
   }
-  const rows = versions.map((v, i) => {
+  let html = "", lastDay = "";
+  versions.forEach((v, i) => {
     const d = stampDate(v.stamp);
-    return `<div class="row"><span class="when">${friendly(d)}<span class="sub">${ago(d)}</span></span>
-      ${v.current ? `<span class="tag">Your save now</span>` : `<button class="btn" data-v="${i}">Go back to this</button>`}</div>`;
+    const day = dayLabel(d);
+    if (day !== lastDay) {
+      html += `${lastDay ? "</div>" : ""}<div class="day">${esc(day)}</div><div class="rows">`;
+      lastDay = day;
+    }
+    html += `<div class="row"><span class="when">${clock(d)}<span class="sub">${ago(d)}</span></span>
+      ${v.current ? `<span class="tag">Your save now</span>` : `<button class="btn" data-v="${i}">${icon("history")} Go back to this</button>`}</div>`;
   });
+  html += "</div>";
+  const n = versions.length;
   $("modal-body").innerHTML = `${head}<div class="modal-body">
-    <p>Each line is your ${esc(g.name)} save as it was at that time. Pick one to go back to it.</p>
-    <div class="rows">${rows.join("")}</div></div>`;
+    <p>${n} saved version${n === 1 ? "" : "s"}, newest first. Going back keeps a copy of your save now, so nothing is ever lost.</p>
+    ${html}</div>`;
+  $("modal-body").querySelector("[data-close]").onclick = closeModal;
+  wireBack();
   $("modal-body").querySelectorAll("[data-v]").forEach((b) => (b.onclick = () => confirmRestore(g, versions[+b.dataset.v])));
 }
 
@@ -365,6 +470,8 @@ function showSettings() {
       <div class="setting"><div class="label"><b>Save backups</b><span class="path">${esc(b.dir)}</span>
         <span>${b.on_target ? last : "This folder can't be found (is the drive plugged in?). Backups are kept on this computer until it's back."}</span></div>
         <div class="btns"><button class="btn" id="s-backup-now">Back up now</button><button class="btn" id="s-backup-dir">Change...</button><button class="btn" id="s-backup-open">Open</button></div></div>
+      <div class="setting"><div class="label"><b>Look</b><span>Dark mode follows your computer unless you pick one.</span></div>
+        <div class="seg">${["auto", "light", "dark"].map((t) => `<button data-look="${t}" class="${pref.get("theme", "auto") === t ? "on" : ""}">${t[0].toUpperCase() + t.slice(1)}</button>`).join("")}</div></div>
       <div class="setting"><div class="label"><b>Automatic save states</b><span>Saves your exact spot in the game every few minutes, as a safety net. Press Ctrl+V in a game to jump back to the newest one.</span></div>
         <div class="seg">${seg}</div></div>
       <div class="setting"><div class="label"><b>Play in full screen</b><span>Press F11 in the game to switch.</span></div>
@@ -400,6 +507,12 @@ function showSettings() {
     await invoke("set_autosave", { minutes: +btn.dataset.auto });
     lib.autosave_minutes = +btn.dataset.auto;
     document.querySelectorAll("[data-auto]").forEach((x) => x.classList.toggle("on", x === btn));
+    sound("move");
+  }));
+  document.querySelectorAll("[data-look]").forEach((btn) => (btn.onclick = () => {
+    pref.set("theme", btn.dataset.look);
+    applyTheme(btn.dataset.look);
+    document.querySelectorAll("[data-look]").forEach((x) => x.classList.toggle("on", x === btn));
     sound("move");
   }));
   $("s-full").onclick = async (ev) => {
@@ -492,6 +605,7 @@ window.addEventListener("gamepaddisconnected", () => lib && renderHints());
 $("btn-add").onclick = pickGames;
 $("btn-folder").onclick = () => invoke("open_folder", { which: "games" });
 $("btn-settings").onclick = () => lib && showSettings();
+$("btn-saves").onclick = () => lib && showSavesList();
 $("backup-pill").onclick = () => lib && showSettings();
 
 listen("copy-progress", ({ payload }) => {

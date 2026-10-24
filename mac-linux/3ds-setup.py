@@ -110,7 +110,9 @@ def load_config():
 
 def save_config(cfg):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".partial")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.replace(tmp, CONFIG_PATH)  # the 3DS app may be reading it right now
 
 
 def azahar_dirs():

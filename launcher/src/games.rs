@@ -18,6 +18,7 @@ const MAX_DECOMPRESSED: usize = 96 << 20;
 #[derive(Default, Debug, Clone)]
 pub struct RomInfo {
     pub title_id: Option<u64>,
+    pub product_code: Option<String>, // "ECRE" from CTR-P-ECRE: what box-art sites file games under
     pub name: Option<String>,
     pub publisher: Option<String>,
     pub icon: Option<String>, // data: URL
@@ -115,6 +116,8 @@ fn parse_ncch(src: &mut dyn Source, base: u64, info: &mut RomInfo) {
         return;
     }
     info.title_id = Some(u64le(&h, 0x118));
+    let product = String::from_utf8_lossy(&h[0x150..0x160]).trim_end_matches('\0').to_string();
+    info.product_code = product.rsplit('-').next().filter(|c| c.len() == 4).map(str::to_string);
     let no_crypto = h[0x18F] & 0x4 != 0;
     info.encrypted = !no_crypto;
     let exefs = u64::from(u32le(&h, 0x1A0)) * 0x200;
@@ -161,7 +164,7 @@ fn parse_cia(src: &mut dyn Source, head: &[u8], info: &mut RomInfo) {
             read_smdh(&smdh, info);
         }
     }
-    if info.icon.is_none() && !info.encrypted {
+    if !info.encrypted {
         let tid = info.title_id;
         parse_ncch(src, content_off, info);
         info.title_id = tid.or(info.title_id);
@@ -224,7 +227,7 @@ fn icon_data_url(raw: &[u8]) -> String {
     format!("data:image/bmp;base64,{}", base64(&bmp))
 }
 
-fn base64(data: &[u8]) -> String {
+pub fn base64(data: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -310,8 +313,9 @@ mod tests {
         for path in paths {
             let info = read_rom(&path);
             println!(
-                "{}: tid={:?} name={:?} publisher={:?} encrypted={} cia={} homebrew={} icon={}",
+                "{}: code={:?} tid={:?} name={:?} publisher={:?} encrypted={} cia={} homebrew={} icon={}",
                 path.file_name().unwrap().to_string_lossy(),
+                info.product_code,
                 info.title_id.map(title_hex),
                 info.name,
                 info.publisher,

@@ -105,10 +105,25 @@ impl Paths {
 
 // ---------------------------------------------------------------- settings (config.json)
 
-fn read_json(path: &Path) -> Map<String, Value> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    // PowerShell writes a byte order mark
-    serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or_default()
+/// Setup and the watcher use these files too. On Windows a file can't be opened while another
+/// program is writing it, and a reader can catch it half-written, so keep trying for a moment.
+fn read_json(path: &Path) -> Result<Map<String, Value>, String> {
+    if !path.exists() {
+        return Ok(Map::new());
+    }
+    let mut last = String::new();
+    for _ in 0..30 {
+        match std::fs::read_to_string(path) {
+            // PowerShell writes a byte order mark
+            Ok(text) => match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+                Ok(map) => return Ok(map),
+                Err(e) => last = e.to_string(),
+            },
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("couldn't read {}: {last}", path.display()))
 }
 
 fn write_json(path: &Path, map: &Map<String, Value>) -> Result<(), String> {
@@ -118,7 +133,15 @@ fn write_json(path: &Path, map: &Map<String, Value>) -> Result<(), String> {
     let tmp = path.with_extension("json.partial");
     let text = serde_json::to_string_pretty(map).map_err(|e| e.to_string())? + "\n";
     std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let mut result = Ok(());
+    for _ in 0..30 {
+        result = std::fs::rename(&tmp, path);
+        if result.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    result.map_err(|e| e.to_string())
 }
 
 struct Config {
@@ -129,7 +152,7 @@ struct Config {
 }
 
 fn config(p: &Paths) -> Config {
-    let c = read_json(&p.config);
+    let c = read_json(&p.config).unwrap_or_default();
     let path = |k: &str, default: PathBuf| c.get(k).and_then(Value::as_str).map(PathBuf::from).unwrap_or(default);
     Config {
         backup_dir: path("backup_dir", p.home.join("3DS-Backups")),
@@ -140,7 +163,8 @@ fn config(p: &Paths) -> Config {
 }
 
 fn set_config_value(p: &Paths, key: &str, value: Value) -> Result<(), String> {
-    let mut c = read_json(&p.config);
+    // Never write settings we couldn't read: that would drop the other settings.
+    let mut c = read_json(&p.config)?;
     c.insert(key.into(), value);
     write_json(&p.config, &c)
 }
@@ -229,6 +253,7 @@ fn ensure_watcher(p: &Paths) {
 struct Game {
     path: String,
     title_id: Option<String>,
+    product_code: Option<String>,
     name: String,
     publisher: Option<String>,
     icon: Option<String>,
@@ -328,7 +353,7 @@ fn installed_games(p: &Paths) -> Vec<(PathBuf, games::RomInfo)> {
 }
 
 fn launcher_state(p: &Paths) -> Map<String, Value> {
-    read_json(&p.launcher_state())
+    read_json(&p.launcher_state()).unwrap_or_default()
 }
 
 fn scan(p: &Paths, playing: Option<String>) -> Library {
@@ -384,6 +409,7 @@ fn scan(p: &Paths, playing: Option<String>) -> Library {
             let key = path.to_string_lossy().to_string();
             Game {
                 title_id: tid,
+                product_code: info.product_code.filter(|_| kind != "homebrew"),
                 name,
                 publisher: info.publisher,
                 icon: info.icon,
@@ -647,6 +673,78 @@ fn watch_game(app: AppHandle, mut child: std::process::Child) {
     let _ = app.emit("backed-up", backed_up);
 }
 
+/// Box art from GameTDB (the database other emulator front-ends use), cached on disk.
+#[tauri::command]
+async fn cover(app: AppHandle, code: String) -> Result<Option<String>, String> {
+    blocking(move || {
+        if code.len() != 4 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let dir = paths(&app).install_dir.join("covers");
+        let file = dir.join(format!("{code}.jpg"));
+        let missing = dir.join(format!("{code}.none"));
+        if !file.exists() {
+            // Don't ask again for a few days about a game the site doesn't have.
+            let asked = missing.metadata().and_then(|m| m.modified()).ok();
+            if asked.is_some_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(3 * 86400)) {
+                return None;
+            }
+            let _ = std::fs::create_dir_all(&dir);
+            match download_cover(&code) {
+                Ok(Some(jpg)) => {
+                    let tmp = file.with_extension("partial");
+                    std::fs::write(&tmp, jpg).ok()?;
+                    std::fs::rename(&tmp, &file).ok()?;
+                }
+                Ok(None) => {
+                    let _ = std::fs::write(&missing, "");
+                    return None;
+                }
+                Err(()) => return None, // offline: try again next time
+            }
+        }
+        let jpg = std::fs::read(&file).ok()?;
+        Some(format!("data:image/jpeg;base64,{}", games::base64(&jpg)))
+    })
+    .await
+}
+
+/// Ok(None): the site has no box art for this game. Err: the site couldn't be reached.
+fn download_cover(code: &str) -> Result<Option<Vec<u8>>, ()> {
+    use std::io::Read;
+    // The code's last letter is the region the game was sold in.
+    let home = match code.as_bytes()[3] {
+        b'P' | b'V' | b'X' | b'Y' | b'Z' => "EN",
+        b'J' => "JA",
+        b'K' => "KO",
+        b'D' => "DE",
+        b'F' => "FR",
+        b'S' => "ES",
+        b'I' => "IT",
+        b'H' => "NL",
+        b'R' => "RU",
+        _ => "US",
+    };
+    let mut reached = false;
+    let mut regions = vec![home];
+    regions.extend(["US", "EN", "JA"].into_iter().filter(|r| *r != home));
+    for region in regions {
+        let url = format!("https://art.gametdb.com/3ds/coverHQ/{region}/{code}.jpg");
+        match ureq::get(&url).set("User-Agent", "3ds-setup").timeout(Duration::from_secs(20)).call() {
+            Ok(resp) => {
+                reached = true;
+                let mut jpg = Vec::new();
+                if resp.into_reader().take(8 << 20).read_to_end(&mut jpg).is_ok() && jpg.starts_with(&[0xFF, 0xD8]) {
+                    return Ok(Some(jpg));
+                }
+            }
+            Err(ureq::Error::Status(..)) => reached = true,
+            Err(_) => {}
+        }
+    }
+    if reached { Ok(None) } else { Err(()) }
+}
+
 #[tauri::command]
 async fn open_azahar(app: AppHandle) -> Result<(), String> {
     let p = paths(&app);
@@ -730,6 +828,7 @@ fn main() {
             backup_now,
             add_games,
             play,
+            cover,
             open_azahar,
             open_folder,
             set_autosave,

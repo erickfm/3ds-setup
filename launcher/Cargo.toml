@@ -20,6 +20,7 @@ serde_json = "1"
 ruzstd = "0.8"
 zip = { version = "2", default-features = false }
 crc32fast = "1"
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -105,11 +105,19 @@ function Notify($msg) {
     } catch {}
 }
 
+function Invoke-WithRetry([scriptblock]$action) {
+    # The watcher, setup and the 3DS app all use config.json, and Windows won't open a file
+    # another program is in the middle of reading or writing. Wait a moment and try again.
+    for ($i = 1; ; $i++) {
+        try { return (& $action) } catch { if ($i -ge 30) { throw }; Start-Sleep -Milliseconds 100 }
+    }
+}
+
 function Get-Config {
     $cfg = [ordered]@{}
     foreach ($k in $Defaults.Keys) { $cfg[$k] = $Defaults[$k] }
     if (Test-Path -LiteralPath $ConfigPath) {
-        $saved = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        $saved = Invoke-WithRetry { [IO.File]::ReadAllText($ConfigPath) | ConvertFrom-Json }
         foreach ($p in $saved.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
     }
     return $cfg
@@ -117,7 +125,8 @@ function Get-Config {
 
 function Save-Config($cfg) {
     New-Item -ItemType Directory -Force -Path (Split-Path $ConfigPath) | Out-Null
-    $cfg | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8
+    $json = $cfg | ConvertTo-Json
+    Invoke-WithRetry { [IO.File]::WriteAllText($ConfigPath, $json, (New-Object Text.UTF8Encoding($true))) }
 }
 
 function Get-AzaharUserDir {

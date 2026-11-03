@@ -62,6 +62,20 @@ jobs:
           name: ${{ matrix.file }}
           path: ${{ matrix.file }}
           if-no-files-found: error
+      - name: Self-contained Linux build (brings its own WebKitGTK, for SteamOS)
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"  # the AppImage build tools themselves run without FUSE
+        run: |
+          npx --yes @tauri-apps/cli@2.12.1 build --bundles appimage
+          cp target/release/bundle/appimage/*.AppImage ../3ds-launcher-linux-x86_64.AppImage
+          ls -la ../3ds-launcher-linux-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: 3ds-launcher-linux-x86_64.AppImage
+          path: 3ds-launcher-linux-x86_64.AppImage
+          if-no-files-found: error
 
   windows:
     needs: launcher
@@ -282,9 +296,69 @@ jobs:
           curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh | sh -s -- --backup-dir "$RUNNER_TEMP/bk2" --controller no
           ~/.local/bin/3ds-setup status
 
+  # SteamOS is Arch-based and has no WebKitGTK. An Arch container that says it's SteamOS runs
+  # the Steam Deck path: no questions, controller set up, the self-contained 3DS app, and 3DS
+  # added to a (fake) Steam library.
+  steamdeck:
+    needs: launcher
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: 3ds-launcher-linux-x86_64.tar.gz
+          path: ${{ runner.temp }}/launcher
+      - uses: actions/download-artifact@v4
+        with:
+          name: 3ds-launcher-linux-x86_64.AppImage
+          path: ${{ runner.temp }}/launcher
+      - name: Make it look like a Steam Deck
+        run: |
+          pacman -Syu --noconfirm --needed python xorg-server-xvfb
+          printf 'NAME="SteamOS"\nID=steamos\nID_LIKE=arch\n' > /etc/os-release
+          mkdir -p "$HOME/.local/share/Steam/userdata/12345/config"
+          if pacman -Q webkit2gtk-4.1 2>/dev/null; then echo "WebKitGTK is installed; test is meaningless"; exit 1; fi
+
+      - name: Install (no CI flag, so it runs exactly as on a Deck)
+        run: |
+          env -u CI THREEDS_LAUNCHER="$RUNNER_TEMP/launcher/3ds-launcher-linux-x86_64.tar.gz" \
+            THREEDS_LAUNCHER_APPIMAGE="$RUNNER_TEMP/launcher/3ds-launcher-linux-x86_64.AppImage" \
+            sh mac-linux/install.sh </dev/null
+
+      - name: Check the Steam Deck setup
+        run: |
+          set -e
+          L="$HOME/.local/share/3ds-setup/3ds-launcher"
+          cmp "$L" "$RUNNER_TEMP/launcher/3ds-launcher-linux-x86_64.AppImage" && echo "ok: self-contained 3DS app"
+          grep -q 'maptype:all' "$HOME/.config/azahar-emu/qt-config.ini" && echo "ok: controller preset"
+          python3 -c "import json,sys; c=json.load(open(sys.argv[1])); assert c['controller'] is True" \
+            "$HOME/.config/3ds-setup/config.json" && echo "ok: controller chosen without asking"
+          grep -q '3ds-launcher' "$HOME/.local/share/Steam/userdata/12345/config/shortcuts.vdf" && echo "ok: in the Steam library"
+
+      - name: The 3DS app starts and stays up without system WebKitGTK
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"  # no FUSE in a container
+          WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS: "1"  # no bubblewrap as root in a container
+        run: |
+          set +e
+          timeout 15 xvfb-run -a "$HOME/.local/share/3ds-setup/3ds-launcher"
+          code=$?
+          [ $code -eq 124 ] || { echo "the 3DS app quit early (exit $code)"; exit 1; }
+          echo "ok: 3DS app runs"
+
+      - name: Uninstall takes it out of Steam
+        run: |
+          set -e
+          env -u CI python3 "$HOME/.local/share/3ds-setup/3ds-setup.py" uninstall --yes
+          if grep -q '3ds-launcher' "$HOME/.local/share/Steam/userdata/12345/config/shortcuts.vdf"; then echo "still in Steam"; exit 1; fi
+          test ! -e "$HOME/.local/share/3ds-setup/3ds-launcher"
+          echo "ok: uninstalled"
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [windows, unix]
+    needs: [windows, unix, steamdeck]
     runs-on: ubuntu-latest
     permissions:
       contents: write

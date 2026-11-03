@@ -22,12 +22,14 @@ import platform
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tarfile
 import time
 import urllib.request
 import zipfile
+import zlib
 from pathlib import Path
 
 APP = "3ds-setup"
@@ -54,6 +56,9 @@ LAUNCH_AGENT_LABEL = "io.github.erickfm.3ds-setup"
 LAUNCH_AGENT = HOME / "Library/LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 LINUX_APPS = XDG_DATA / "applications"
 LINUX_AUTOSTART = XDG_CONFIG / "autostart" / "3ds-setup-watch.desktop"
+# On a Steam Deck the watcher runs as a systemd user service instead: autostart entries only run
+# in Desktop Mode, and Gaming Mode is where people play.
+SYSTEMD_UNIT = XDG_CONFIG / "systemd/user/3ds-setup-watch.service"
 BIN_LINK = HOME / ".local/bin/3ds-setup"
 VERSION_FILE = INSTALL_DIR / "azahar-version.txt"
 HEARTBEAT = INSTALL_DIR / "watch.heartbeat"  # touched every tick so the 3DS app can tell we're running
@@ -228,6 +233,21 @@ def pick(prompt, options):
     if answer.isdigit() and 1 <= int(answer) <= len(options):
         return int(answer) - 1
     return None
+
+
+def is_steam_deck():
+    """Valve hardware (Steam Deck, any OS on it) or SteamOS."""
+    if IS_MAC:
+        return False
+    try:
+        if Path("/sys/class/dmi/id/sys_vendor").read_text().strip() == "Valve":
+            return True
+    except OSError:
+        pass
+    try:
+        return "ID=steamos" in Path("/etc/os-release").read_text().splitlines()
+    except OSError:
+        return False
 
 
 def open_folder(path):
@@ -561,7 +581,8 @@ def ini_set(lines, section, items):
     start, end = rng
     for key, value in items.items():
         for i in range(start, end):
-            if lines[i].startswith(key + "=") or lines[i].startswith(key + "\\default="):
+            if lines[i] is not None and (lines[i].startswith(key + "=")
+                                         or lines[i].startswith(key + "\\default=")):
                 lines[i] = None  # drop the old value and any "use default" flag
         while end > start and lines[end - 1] is not None and not lines[end - 1].strip():
             end -= 1  # insert before the blank line that ends the section
@@ -570,9 +591,10 @@ def ini_set(lines, section, items):
     lines[:] = [ln for ln in lines if ln is not None]
 
 
-# Azahar's own controller Auto-Map: buttons by position, like a real 3DS (SDL button numbers).
+# Buttons go by the letter printed on them (the controller's A is the 3DS A), not by where
+# they sit on a 3DS. SDL button numbers.
 CONTROLLER_BUTTONS = {
-    "button_a": (1, "B"), "button_b": (0, "A"), "button_x": (3, "Y"), "button_y": (2, "X"),
+    "button_a": (0, "A"), "button_b": (1, "B"), "button_x": (2, "X"), "button_y": (3, "Y"),
     "button_up": (11, "D-Pad Up"), "button_down": (12, "D-Pad Down"),
     "button_left": (13, "D-Pad Left"), "button_right": (14, "D-Pad Right"),
     "button_l": (9, "LB"), "button_r": (10, "RB"), "button_start": (6, "Start"),
@@ -598,9 +620,10 @@ def controller_profile():
     return p
 
 
-def setup_azahar_config(cfg, use_controller):
+def setup_azahar_config(cfg, use_controller, deck=False):
     """Point Azahar's game list at the games folder, and (fresh setups only) map a controller.
-    Returns a list of what changed."""
+    On a Steam Deck, also replace a mapping that has no controller in it (Azahar's own keyboard
+    default), since the keyboard is no use there. Returns a list of what changed."""
     _, config_dir = azahar_dirs()
     ini = config_dir / "qt-config.ini"
     lines = ini.read_text(encoding="utf-8").splitlines() if ini.exists() else []
@@ -626,7 +649,11 @@ def setup_azahar_config(cfg, use_controller):
         done.append("games folder")
 
     # Never replace a mapping someone already set up.
-    if use_controller and ini_get(lines, "Controls", "profiles\\size") is None:
+    no_mapping = ini_get(lines, "Controls", "profiles\\size") is None
+    if deck and not no_mapping:
+        lo, hi = ini_section(lines, "Controls")
+        no_mapping = not any("engine:sdl" in line for line in lines[lo:hi])
+    if use_controller and no_mapping:
         ini_set(lines, "Controls", controller_profile())
         done.append("controller")
 
@@ -636,6 +663,138 @@ def setup_azahar_config(cfg, use_controller):
         tmp.write_text("\n".join(lines).strip("\n") + "\n", encoding="utf-8")
         os.replace(tmp, ini)
     return done
+
+
+# ---------------------------------------------------------------- Steam (Steam Deck)
+# Adding 3DS to the Steam library makes it playable from Gaming Mode. Non-Steam games live in
+# userdata/<user>/config/shortcuts.vdf, in Valve's binary KeyValues format.
+
+def vdf_load(data):
+    pos = 0
+
+    def cstr():
+        nonlocal pos
+        end = data.index(b"\0", pos)
+        text = data[pos:end].decode("utf-8", "surrogateescape")
+        pos = end + 1
+        return text
+
+    def obj():
+        nonlocal pos
+        d = {}
+        while True:
+            kind = data[pos]
+            pos += 1
+            if kind == 8:
+                return d
+            key = cstr()
+            if kind == 0:
+                d[key] = obj()
+            elif kind == 1:
+                d[key] = cstr()
+            elif kind == 2:
+                d[key] = struct.unpack_from("<i", data, pos)[0]
+                pos += 4
+            elif kind == 7:
+                d[key] = ("u64", struct.unpack_from("<Q", data, pos)[0])
+                pos += 8
+            else:
+                raise ValueError(f"unknown field type {kind}")
+    return obj()
+
+
+def vdf_dump(d):
+    out = bytearray()
+    for key, value in d.items():
+        k = key.encode("utf-8", "surrogateescape") + b"\0"
+        if isinstance(value, dict):
+            out += b"\0" + k + vdf_dump(value)
+        elif isinstance(value, str):
+            out += b"\1" + k + value.encode("utf-8", "surrogateescape") + b"\0"
+        elif isinstance(value, tuple):
+            out += b"\7" + k + struct.pack("<Q", value[1])
+        else:
+            out += b"\2" + k + struct.pack("<i", value)
+    return bytes(out + b"\x08")
+
+
+def steam_users():
+    for root in (XDG_DATA / "Steam", HOME / ".steam/steam"):
+        if (root / "userdata").is_dir():
+            return [d for d in (root / "userdata").iterdir() if d.name.isdigit() and d.name != "0"]
+    return []
+
+
+def steam_running():
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            if (proc / "comm").read_text().strip() == "steam":
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def steam_shortcut(add=True):
+    """Add 3DS to the Steam library (or take it out). Steam keeps the list in memory and writes
+    it back on exit, so it has to be closed while we change the file. Returns True if done."""
+    exe = LAUNCHER_BIN if LAUNCHER_BIN.exists() else APPIMAGE
+    name = "3DS" if exe == LAUNCHER_BIN else "Azahar (3DS)"
+    ours = {str(LAUNCHER_BIN), str(APPIMAGE)}
+    appid = (zlib.crc32(f'"{exe}"{name}'.encode()) | 0x80000000) - (1 << 32)  # how Steam numbers them
+    entry = {
+        "appid": appid, "AppName": name, "Exe": f'"{exe}"', "StartDir": f'"{exe.parent}/"',
+        "icon": str(LAUNCHER_ICON) if LAUNCHER_ICON.exists() else "", "ShortcutPath": "",
+        "LaunchOptions": "", "IsHidden": 0, "AllowDesktopConfig": 1, "AllowOverlay": 1,
+        "OpenVR": 0, "Devkit": 0, "DevkitGameID": "", "DevkitOverrideAppID": 0,
+        "LastPlayTime": 0, "FlatpakAppID": "", "tags": {},
+    }
+    changes = {}
+    for user in steam_users():
+        path = user / "config/shortcuts.vdf"
+        try:
+            old = path.read_bytes() if path.exists() else b""
+            data = vdf_load(old) if old else {"shortcuts": {}}
+        except (OSError, ValueError, IndexError, struct.error) as e:
+            log(f"couldn't read {path}: {e!r}")
+            continue
+        others = [v for v in data.get("shortcuts", {}).values()
+                  if not (isinstance(v, dict) and str(v.get("Exe", v.get("exe", ""))).strip('"') in ours)]
+        mine = [v for v in data.get("shortcuts", {}).values() if v not in others]
+        if add:  # refresh our entry, keeping what Steam learned about it
+            keep = {k: mine[0][k] for k in ("LastPlayTime", "IsHidden", "tags") if mine and k in mine[0]}
+            others.append({**entry, **keep})
+        data["shortcuts"] = {str(i): v for i, v in enumerate(others)}
+        new = vdf_dump(data)
+        if new != old:
+            changes[path] = new
+    if not changes:
+        return True
+    if steam_running():
+        print("Closing Steam for a moment to " + ("add 3DS to" if add else "remove 3DS from") + " your library...")
+        try:
+            subprocess.run(["steam", "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        for _ in range(60):
+            if not steam_running():
+                break
+            time.sleep(1)
+        else:
+            log("Steam didn't close, so 3DS wasn't added to the Steam library")
+            return False
+        time.sleep(2)  # let it finish writing its own files
+    for path, new in changes.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        backup = path.with_name("shortcuts.vdf.before-3ds-setup")
+        if path.exists() and not backup.exists():
+            shutil.copy2(path, backup)
+        tmp = path.with_name(path.name + ".partial")
+        tmp.write_bytes(new)
+        os.replace(tmp, path)
+    log(("added 3DS to" if add else "removed 3DS from") + f" the Steam library ({len(changes)} user(s))")
+    return True
 
 
 # ---------------------------------------------------------------- commands
@@ -827,12 +986,14 @@ def install_mac_app(zip_path, dest=MAC_APP, keep_zip=False):
         zip_path.unlink()
 
 
-def launcher_download():
+def launcher_download(key=None):
     """The 3DS app for this computer: a local build (THREEDS_LAUNCHER, for testing) or this
     release's download. None if there's no build for this computer."""
-    if os.environ.get("THREEDS_LAUNCHER"):
-        return Path(os.environ["THREEDS_LAUNCHER"])
-    key = "mac" if IS_MAC else "linux" if platform.machine() in ("x86_64", "amd64") else None
+    local = os.environ.get("THREEDS_LAUNCHER_APPIMAGE" if key == "linux-appimage" else "THREEDS_LAUNCHER")
+    if local:
+        return Path(local)
+    if key is None:
+        key = "mac" if IS_MAC else "linux" if platform.machine() in ("x86_64", "amd64") else None
     if key not in LAUNCHER:
         return None
     name, sha256 = LAUNCHER[key]
@@ -855,6 +1016,8 @@ def install_launcher():
     if IS_MAC:
         install_mac_app(src, MAC_LAUNCHER, keep_zip=local)
         return True
+    if src.name.endswith(".AppImage"):
+        return install_launcher_appimage(src, keep=local)
     with tarfile.open(src) as tar:
         for name, dest in (("3ds-launcher", LAUNCHER_BIN), ("3ds.png", LAUNCHER_ICON)):
             tmp = dest.with_name(dest.name + ".partial")
@@ -866,11 +1029,37 @@ def install_launcher():
     LAUNCHER_BIN.chmod(0o755)
     missing = subprocess.run(["ldd", str(LAUNCHER_BIN)], capture_output=True, text=True).stdout
     missing = [line.split()[0] for line in missing.splitlines() if "not found" in line]
-    if missing:
-        print(f"\nThe 3DS app needs some system libraries this computer doesn't have ({', '.join(missing)}).\n"
-              "On Ubuntu/Debian: sudo apt install libwebkit2gtk-4.1-0   (then run the install again)")
-        LAUNCHER_BIN.unlink()
-        return False
+    if not missing:
+        return True
+    # No WebKitGTK here (SteamOS, for one): use the bigger build that brings its own.
+    log(f"3DS app is missing {', '.join(missing)}; using the self-contained version")
+    try:
+        appimage = launcher_download("linux-appimage")
+    except Exception as e:
+        log(f"couldn't download the self-contained 3DS app: {e!r}")
+        appimage = None
+    if appimage:
+        return install_launcher_appimage(appimage, keep="THREEDS_LAUNCHER_APPIMAGE" in os.environ)
+    print(f"\nThe 3DS app needs some system libraries this computer doesn't have ({', '.join(missing)}).\n"
+          "On Ubuntu/Debian: sudo apt install libwebkit2gtk-4.1-0   (then run the install again)")
+    LAUNCHER_BIN.unlink()
+    return False
+
+
+def install_launcher_appimage(src, keep=False):
+    """The AppImage build goes where the plain binary would, so menus and Steam find it the same way.
+    (The icon came with the plain build; it's also in the AppImage, but this one is enough.)"""
+    tmp = LAUNCHER_BIN.with_name(LAUNCHER_BIN.name + ".partial")
+    if keep:
+        shutil.copy2(src, tmp)
+    else:
+        os.replace(src, tmp)
+    tmp.chmod(0o755)
+    os.replace(tmp, LAUNCHER_BIN)
+    if not LAUNCHER_ICON.exists():
+        here = Path(__file__).resolve().parent.parent / "launcher/icons/128x128@2x.png"
+        if here.exists():
+            shutil.copy2(here, LAUNCHER_ICON)
     return True
 
 
@@ -888,9 +1077,12 @@ def stop_launcher():
     if IS_MAC:
         subprocess.run(["pkill", "-f", str(MAC_LAUNCHER / "Contents/MacOS")], stderr=subprocess.DEVNULL)
         return
+    # The AppImage build runs from a temporary mount, so also look for APPIMAGE=<our file>.
+    marker = f"APPIMAGE={LAUNCHER_BIN}".encode()
     for proc in Path("/proc").glob("[0-9]*"):
         try:
-            if os.readlink(proc / "exe") == str(LAUNCHER_BIN):
+            if (os.readlink(proc / "exe") == str(LAUNCHER_BIN)
+                    or marker in (proc / "environ").read_bytes().split(b"\0")):
                 os.kill(int(proc.name), signal.SIGTERM)
         except (OSError, ValueError):
             pass
@@ -961,6 +1153,18 @@ def start_watcher_at_login(me):
         stop_watcher()
         subprocess.run(["launchctl", "bootstrap", domain, str(LAUNCH_AGENT)], check=True)
         return
+    if is_steam_deck() and systemctl("show-environment"):
+        SYSTEMD_UNIT.parent.mkdir(parents=True, exist_ok=True)
+        SYSTEMD_UNIT.write_text(
+            "[Unit]\nDescription=3DS save backups\n\n"
+            f'[Service]\nExecStart="{sys.executable}" "{me}" watch\nRestart=on-failure\nRestartSec=30\n\n'
+            "[Install]\nWantedBy=default.target\n")
+        LINUX_AUTOSTART.unlink(missing_ok=True)
+        stop_watcher()
+        systemctl("daemon-reload")
+        if systemctl("enable", SYSTEMD_UNIT.name) and systemctl("restart", SYSTEMD_UNIT.name):
+            return
+        log("couldn't start the watcher service; using an autostart entry instead")
     LINUX_AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
     LINUX_AUTOSTART.write_text(
         "[Desktop Entry]\nType=Application\nName=3DS save backups\n"
@@ -968,6 +1172,14 @@ def start_watcher_at_login(me):
     stop_watcher()
     subprocess.Popen([sys.executable, str(me), "watch"], start_new_session=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def systemctl(*args):
+    """systemctl --user; True if it worked."""
+    if not shutil.which("systemctl"):
+        return False
+    return subprocess.run(["systemctl", "--user", *args], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
 
 
 def stop_watcher():
@@ -994,7 +1206,12 @@ def install_titles():
 def cmd_install(args):
     cfg = load_config()
     first_time = not CONFIG_PATH.exists()
-    interactive = not QUIET and sys.stdin.isatty()
+    deck = is_steam_deck()
+    # On a Steam Deck there's nothing to ask: backups go to the default folder and
+    # the built-in controls are a controller.
+    interactive = not QUIET and not deck and sys.stdin.isatty()
+    if deck:
+        print("Steam Deck detected: using the built-in controls and the default backup folder.")
     if args.backup_dir:
         cfg["backup_dir"] = args.backup_dir
     elif first_time and interactive:
@@ -1004,6 +1221,9 @@ def cmd_install(args):
 
     if args.controller:
         cfg["controller"] = args.controller == "yes"
+    elif deck:
+        cfg["controller"] = True
+        cfg.setdefault("launcher_fullscreen", True)
     elif "controller" not in cfg:
         cfg["controller"] = interactive and ask_yes_no(
             "Will you play with a game controller (Xbox, PlayStation, Switch Pro...)?\n\n"
@@ -1026,13 +1246,22 @@ def cmd_install(args):
     if azahar_running():
         print("(Azahar is open, so its settings were left alone. Re-run install after closing it.)")
     else:
-        setup_azahar_config(cfg, cfg["controller"])
+        setup_azahar_config(cfg, cfg["controller"], deck)
     launcher = install_launcher()
     install_helpers(me, launcher)
     start_watcher_at_login(me)
+    in_steam = deck and not QUIET and steam_shortcut()
 
     log(f"installed Azahar {tag}; backups -> {cfg['backup_dir']}" + ("; 3DS app" if launcher else ""))
-    if launcher:
+    if in_steam:
+        name = "3DS" if launcher else "Azahar (3DS)"
+        message(f"All set! {name} is in your Steam library now (under Non-Steam).\n\n"
+                + ("The 3DS app opens next: add your games there now. " if launcher else
+                   "Put your games in the '3DS Games' folder (it opens next). ")
+                + "Then double-click 'Return to Gaming Mode' on the desktop and play from there.\n\n"
+                f"Your saves back up automatically to:\n{cfg['backup_dir']}")
+        open_launcher() if launcher else open_folder(cfg["games_dir"])
+    elif launcher:
         where = "in your Applications folder" if IS_MAC else "in your app menu"
         message(f"All set! The 3DS app opens next. Add your games there and press Play.\n\n"
                 f"You'll find it {where} as '3DS'.\n\n"
@@ -1048,7 +1277,7 @@ def cmd_install(args):
     if IS_MAC:
         print("For auto save-states, macOS will ask to let python3 control your computer\n"
               "(Accessibility). Allow it in System Settings > Privacy & Security > Accessibility.")
-    elif not shutil.which("xdotool"):
+    elif not deck and not shutil.which("xdotool"):  # SteamOS can't apt install
         print("Install xdotool for auto save-states:  sudo apt install xdotool")
 
 
@@ -1064,9 +1293,13 @@ def cmd_uninstall(args):
     if IS_MAC:
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCH_AGENT_LABEL}"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if is_steam_deck() and not QUIET:
+        steam_shortcut(add=False)
+    if SYSTEMD_UNIT.exists():
+        systemctl("disable", "--now", SYSTEMD_UNIT.name)
     stop_watcher()
     stop_launcher()
-    for p in (LAUNCH_AGENT, LINUX_AUTOSTART, BIN_LINK, *LINUX_APPS.glob("*3ds-setup*.desktop")):
+    for p in (LAUNCH_AGENT, LINUX_AUTOSTART, SYSTEMD_UNIT, BIN_LINK, *LINUX_APPS.glob("*3ds-setup*.desktop")):
         if p.is_symlink() or p.exists():
             p.unlink()
     if IS_MAC:

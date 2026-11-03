@@ -2,7 +2,7 @@
 
 Play 3DS games on your computer without ever losing a save. This installs [Azahar](https://azahar-emu.org) (the 3DS emulator that replaced Citra) and **3DS**, a little app that looks like the 3DS home screen: your games with their real icons, a big Play button, and every older save one click away. Your saves are backed up quietly while you play.
 
-Works on **Windows, Mac and Linux**.
+Works on **Windows, Mac, Linux and Steam Deck**.
 
 ## Install
 
@@ -30,6 +30,22 @@ Works on **Windows, Mac and Linux**.
 
 The first time an autosave happens, macOS asks whether "python3" may control your computer. Allow it: click **OK**, and when one of the prompts sends you to **System Settings**, switch python3 on there. If you skip this, everything still works except the automatic save states.
 
+### Steam Deck
+
+You only need Desktop Mode once, to install. After that you play from Gaming Mode.
+
+1. Switch to **Desktop Mode**: press the **STEAM** button → **Power** → **Switch to Desktop**.
+2. Start the installer, whichever way is easier:
+   - **If you have a web browser:** download **[3DS-Setup-SteamDeck.desktop](https://github.com/erickfm/3ds-setup/releases/latest/download/3DS-Setup-SteamDeck.desktop)**, open your **Downloads** folder and double-click it. If it asks whether to run it, say yes.
+   - **Otherwise:** open **Konsole** from the app menu (bottom-left corner), press **STEAM + X** to bring up the keyboard, type this line and press Enter:
+     ```
+     curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh | sh
+     ```
+3. There are no questions. Steam closes for a moment while **3DS** is added to your library, then the 3DS app opens. Add your games there.
+4. Double-click **Return to Gaming Mode** on the desktop. **3DS** is in your Library under **Non-Steam**.
+
+The Deck's controls are set up for you (see [Playing](#playing)), and saves back up automatically in Gaming Mode too.
+
 ### Linux
 
 Same line as on Mac:
@@ -44,7 +60,8 @@ Open **3DS**.
 
 - **Add games:** click **Add games** (or drag game files onto the window). Azahar needs decrypted game files (`.3ds`, `.cci`, `.cxi`, `.cia`, `.3dsx`, or the compressed `.zcci`/`.zcia`). Dump them from a 3DS you own ([how](https://azahar-emu.org/pages/faq/)). A `.cia` gets set up inside Azahar the first time you play it.
 - **Play:** click a game, then **Play** (or double-click it). The game opens in Azahar; close that window to come back. Arrow keys and Enter work too, and so does a controller (D-pad to choose, A to play).
-- **Controller:** plug it in before you start a game. Buttons are laid out like a real 3DS: A is the right face button, B the bottom one.
+- **Controller:** plug it in before you start a game. Buttons go by their letters: the controller's A is the 3DS A, B is B, and so on.
+- **Steam Deck:** **A**, **B**, **X** and **Y** are the same buttons as on a 3DS. **L1/R1** are L and R, **L2/R2** are ZL and ZR, **☰** is Start and **⧉** is Select. The left stick is the Circle Pad, and you tap the touchscreen for the bottom screen.
 - **Saves back up automatically** every few minutes while you play, and again when you stop. Each game shows when it was last saved and whether that save is backed up.
 - **Box art** for each game is downloaded from [GameTDB](https://www.gametdb.com) the first time it's shown.
 - **Dark mode** follows your computer; pick Light or Dark in Settings (the gear) to override it.
@@ -106,7 +123,7 @@ Azahar has no timer for save states, so the watcher presses that hotkey for you.
 
 ### What setup changes in Azahar
 
-It adds the `3DS Games` folder to the game list. If you chose a controller and Azahar has no button mapping yet, it also sets up a controller profile that works with any controller (Azahar's own Auto-Map layout). An existing mapping is never touched.
+It adds the `3DS Games` folder to the game list. If you chose a controller and Azahar has no button mapping yet, it also sets up a controller profile that works with any controller, with each button matching its letter (A is A). An existing mapping is never touched.
 
 ### The 3DS app
 

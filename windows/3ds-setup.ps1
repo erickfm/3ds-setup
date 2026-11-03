@@ -532,9 +532,10 @@ function Set-IniValues([System.Collections.Generic.List[string]]$lines, $section
     }
 }
 
-# Azahar's own controller Auto-Map: buttons by position, like a real 3DS (SDL button numbers).
+# Buttons go by the letter printed on them (the controller's A is the 3DS A), not by where
+# they sit on a 3DS. SDL button numbers.
 $ControllerButtons = [ordered]@{
-    button_a = @(1, 'B'); button_b = @(0, 'A'); button_x = @(3, 'Y'); button_y = @(2, 'X')
+    button_a = @(0, 'A'); button_b = @(1, 'B'); button_x = @(2, 'X'); button_y = @(3, 'Y')
     button_up = @(11, 'D-Pad Up'); button_down = @(12, 'D-Pad Down'); button_left = @(13, 'D-Pad Left'); button_right = @(14, 'D-Pad Right')
     button_l = @(9, 'LB'); button_r = @(10, 'RB'); button_start = @(6, 'Start'); button_select = @(4, 'Back'); button_home = @(5, 'Guide')
 }

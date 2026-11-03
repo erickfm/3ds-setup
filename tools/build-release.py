@@ -2,6 +2,7 @@
 """Build the release files into dist/:
   3DS-Setup-Windows.bat   one double-clickable file (the PowerShell script is embedded in it)
   install.sh, 3ds-setup.py, titles.json   for the Mac/Linux one-line install
+  3DS-Setup-SteamDeck.desktop   double-click on a Steam Deck to run that one-line install
   the 3DS app for each system, when --launchers points at the CI builds of it
 
   tools/build-release.py [--tag v1.2.3 --launchers DIR]
@@ -22,7 +23,19 @@ LAUNCHERS = {
     "windows": "3ds-launcher-windows-x64.exe",
     "mac": "3DS-macOS.zip",
     "linux": "3ds-launcher-linux-x86_64.tar.gz",
+    "linux-appimage": "3ds-launcher-linux-x86_64.AppImage",  # brings its own WebKitGTK (SteamOS)
 }
+
+# Steam Deck: download this in Desktop Mode and double-click it, instead of typing the curl line
+# on the touch keyboard. It opens a terminal that runs the one-line install.
+DECK = """[Desktop Entry]
+Type=Application
+Name=3DS Setup
+Comment=Install 3DS games support (Azahar) with automatic save backups
+Icon=system-software-install
+Terminal=true
+Exec=sh -c "curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh | sh; echo; echo Press Enter to close.; read x"
+"""
 
 # The batch part copies everything after MARKER into %LOCALAPPDATA%\3ds-setup\3ds-setup.ps1 and
 # runs it. cmd stops reading at "exit /b", so it never sees the PowerShell below the marker.
@@ -72,6 +85,7 @@ def main():
     bat = BAT + MARKER + "\n" + ps1
     (DIST / "3DS-Setup-Windows.bat").write_bytes(bat.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii"))
     (DIST / "3ds-setup.py").write_text(py, encoding="utf-8")
+    (DIST / "3DS-Setup-SteamDeck.desktop").write_text(DECK, encoding="utf-8")
     for src in ("mac-linux/install.sh", "titles.json"):
         shutil.copy2(ROOT / src, DIST / Path(src).name)
     for f in sorted(DIST.iterdir()):

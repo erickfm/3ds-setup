@@ -19,6 +19,31 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// A Command for another program. Inside our AppImage the environment points at the libraries
+/// bundled with us (XDG_DATA_DIRS, GTK_PATH...); Azahar, python and xdg-open must not pick those up.
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "linux")]
+    if let Some(appdir) = std::env::var("APPDIR").ok().filter(|d| d.len() > 1) {
+        for (key, value) in std::env::vars_os() {
+            let value = value.to_string_lossy();
+            if !value.contains(&appdir) {
+                continue;
+            }
+            let kept: Vec<&str> = value.split(':').filter(|s| !s.is_empty() && !s.starts_with(&appdir)).collect();
+            if kept.is_empty() {
+                cmd.env_remove(&key);
+            } else {
+                cmd.env(&key, kept.join(":"));
+            }
+        }
+        for key in ["APPDIR", "APPIMAGE", "ARGV0", "OWD", "GDK_BACKEND", "GTK_THEME", "WEBKIT_DISABLE_DMABUF_RENDERER"] {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 // ---------------------------------------------------------------- where things are
 // Must match 3ds-setup.py / 3ds-setup.ps1.
 
@@ -184,7 +209,7 @@ fn script_command(p: &Paths, args: &[&str]) -> Command {
     #[cfg(windows)]
     {
         let root = env_path("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        let mut cmd = Command::new(root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+        let mut cmd = command(root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
         cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
         cmd.arg(p.install_dir.join("3ds-setup.ps1"));
         // PowerShell spells options -Game / -Quiet
@@ -199,7 +224,7 @@ fn script_command(p: &Paths, args: &[&str]) -> Command {
     #[cfg(not(windows))]
     {
         let bundled = p.install_dir.join("python/bin/python3");
-        let mut cmd = Command::new(if bundled.exists() { bundled } else { PathBuf::from("python3") });
+        let mut cmd = command(if bundled.exists() { bundled } else { PathBuf::from("python3") });
         cmd.arg(p.install_dir.join("3ds-setup.py"));
         cmd.args(args);
         cmd
@@ -230,6 +255,19 @@ fn watcher_alive(p: &Paths) -> bool {
 fn ensure_watcher(p: &Paths) {
     if watcher_alive(p) {
         return;
+    }
+    // Linux setups run it as a systemd user service. Starting it that way (rather than as our
+    // child) also keeps Steam from thinking 3DS is still running after you quit it.
+    #[cfg(target_os = "linux")]
+    {
+        let started = command("systemctl")
+            .args(["--user", "start", "3ds-setup-watch.service"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if started.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
     }
     let mut cmd = script_command(p, &["watch"]);
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -595,7 +633,7 @@ fn install_cia(p: &Paths, cia: &Path) -> Result<PathBuf, String> {
     if info.encrypted {
         return Err("This game file is encrypted, so Azahar can't play it. You need a decrypted copy.".into());
     }
-    let status = Command::new(&p.azahar)
+    let status = command(&p.azahar)
         .arg("-i")
         .arg(cia)
         .status()
@@ -633,7 +671,7 @@ async fn play(app: AppHandle, playing: State<'_, Playing>, path: String, name: S
         }
         let _ = write_json(&p.launcher_state(), &state);
 
-        let mut cmd = Command::new(&p.azahar);
+        let mut cmd = command(&p.azahar);
         if config(&p).fullscreen {
             cmd.arg("-f");
         }
@@ -748,7 +786,7 @@ fn download_cover(code: &str) -> Result<Option<Vec<u8>>, ()> {
 #[tauri::command]
 async fn open_azahar(app: AppHandle) -> Result<(), String> {
     let p = paths(&app);
-    Command::new(&p.azahar).spawn().map(|_| ()).map_err(|e| format!("couldn't start Azahar: {e}"))
+    command(&p.azahar).spawn().map(|_| ()).map_err(|e| format!("couldn't start Azahar: {e}"))
 }
 
 #[tauri::command]
@@ -764,7 +802,7 @@ fn open_folder(app: AppHandle, which: String) -> Result<(), String> {
     } else {
         "xdg-open"
     };
-    Command::new(opener).arg(&dir).spawn().map(|_| ()).map_err(|e| e.to_string())
+    command(opener).arg(&dir).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -812,6 +850,13 @@ fn copy_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 fn main() {
+    // Our AppImage brings its own WebKitGTK, and its DMA-BUF renderer can show a blank window with
+    // the system's graphics drivers (e.g. under the Steam Deck's Gaming Mode). Child programs
+    // don't inherit this; see command().
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("APPIMAGE").is_some() && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(w) = app.get_webview_window("main") {

@@ -42,7 +42,9 @@ You only need Desktop Mode once, to install. After that you play from Gaming Mod
      curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install.sh | sh
      ```
 3. There are no questions. Steam closes for a moment while **3DS** is added to your library, then the 3DS app opens. Add your games there.
-4. Double-click **Return to Gaming Mode** on the desktop. **3DS** is in your Library under **Non-Steam**.
+4. Double-click **Return to Gaming Mode** on the desktop. **3DS** is in your Library under **Non-Steam**, with its own artwork.
+
+On the Deck the app fills the screen, with the selected game on the left, your games on the right and bigger text.
 
 The Deck's controls are set up for you (see [Playing](#playing)), and saves back up automatically in Gaming Mode too.
 
@@ -58,7 +60,8 @@ curl -fsSL https://github.com/erickfm/3ds-setup/releases/latest/download/install
 
 Open **3DS**.
 
-- **Add games:** click **Add games** (or drag game files onto the window). Azahar needs decrypted game files (`.3ds`, `.cci`, `.cxi`, `.cia`, `.3dsx`, or the compressed `.zcci`/`.zcia`). Dump them from a 3DS you own ([how](https://azahar-emu.org/pages/faq/)). A `.cia` gets set up inside Azahar the first time you play it.
+- **Your games show up by themselves** from the `3DS Games` folder, Downloads, Desktop, a `Games` folder, EmuDeck's `Emulation/roms`, and (on Linux) memory cards and USB drives, such as a Steam Deck's microSD card.
+- **Add games:** click **Add games** (or drag game files onto the window) to copy games into the `3DS Games` folder. Azahar needs decrypted game files (`.3ds`, `.cci`, `.cxi`, `.cia`, `.3dsx`, or the compressed `.zcci`/`.zcia`). Dump them from a 3DS you own ([how](https://azahar-emu.org/pages/faq/)). A `.cia` gets set up inside Azahar the first time you play it.
 - **Play:** click a game, then **Play** (or double-click it). The game opens in Azahar; close that window to come back. Arrow keys and Enter work too, and so does a controller (D-pad to choose, A to play).
 - **Controller:** plug it in before you start a game. Buttons go by their letters: the controller's A is the 3DS A, B is B, and so on.
 - **Steam Deck:** **A**, **B**, **X** and **Y** are the same buttons as on a 3DS. **L1/R1** are L and R, **L2/R2** are ZL and ZR, **☰** is Start and **⧉** is Select. The left stick is the Circle Pad, and you tap the touchscreen for the bottom screen.

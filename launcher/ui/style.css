@@ -656,3 +656,30 @@ img.art { display: block; object-fit: cover; }
 }
 .day:first-child { margin-top: 0; }
 .summary { display: flex; gap: calc(var(--u) * 1); flex-wrap: wrap; margin-bottom: calc(var(--u) * 1.6); }
+
+/* ------------------------------------------------------------ Steam Deck */
+
+/* The Deck's screen is wide and short (1280x800), so stacking the two screens would leave them
+   small. Here they sit side by side at full height: the selected game on the left, the library on
+   the right, with everything sized up (u is about 8.5px here instead of 6) so text reads easily
+   at arm's length. */
+:root.handheld {
+  --u: min(calc((100vh - 32px) / 90), calc((100vw - 48px) / 144));
+}
+.handheld .console {
+  flex-direction: row;
+  align-items: stretch;
+  padding: 16px;
+}
+.handheld .screen.top { flex: 1; width: auto; height: auto; min-width: 0; }
+.handheld .screen.bottom { width: calc(var(--u) * 64); height: auto; flex: none; }
+.handheld .hinge { width: 16px; height: auto; }
+.handheld .hinge span { display: none; }
+.handheld .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+/* the selected game: picture on top, details under it, all centered */
+.handheld .stage { flex-direction: column; justify-content: center; text-align: center; gap: calc(var(--u) * 3.5); padding: calc(var(--u) * 3); }
+.handheld .banner-text { flex: none; width: 100%; }
+.handheld .chips, .handheld .actions { justify-content: center; }
+.handheld .boxart { height: calc(var(--u) * 30); }
+.handheld .note { text-align: left; }

@@ -3,6 +3,7 @@
   3DS-Setup-Windows.bat   one double-clickable file (the PowerShell script is embedded in it)
   install.sh, 3ds-setup.py, titles.json   for the Mac/Linux one-line install
   3DS-Setup-SteamDeck.desktop   double-click on a Steam Deck to run that one-line install
+  steam-*.png   the 3DS app's Steam library artwork, for Steam Deck installs
   the 3DS app for each system, when --launchers points at the CI builds of it
 
   tools/build-release.py [--tag v1.2.3 --launchers DIR]
@@ -86,6 +87,8 @@ def main():
     (DIST / "3DS-Setup-Windows.bat").write_bytes(bat.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii"))
     (DIST / "3ds-setup.py").write_text(py, encoding="utf-8")
     (DIST / "3DS-Setup-SteamDeck.desktop").write_text(DECK, encoding="utf-8")
+    for art in sorted((ROOT / "launcher/steam").glob("*.png")):  # Steam library artwork (Steam Deck)
+        shutil.copy2(art, DIST / f"steam-{art.name}")
     for src in ("mac-linux/install.sh", "titles.json"):
         shutil.copy2(ROOT / src, DIST / Path(src).name)
     for f in sorted(DIST.iterdir()):

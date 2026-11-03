@@ -6,7 +6,7 @@ const dialog = window.__TAURI__.dialog;
 const $ = (id) => document.getElementById(id);
 
 const EXTENSIONS = ["3ds", "cci", "cxi", "3dsx", "cia", "zcci", "zcxi", "z3dsx", "zcia"];
-const COLUMNS = 5;
+let COLUMNS = 5; // 4 on a Steam Deck, where tiles are bigger
 
 let lib = null;        // what the backend found: games, backups, settings
 let selected = null;   // path of the selected game
@@ -122,6 +122,8 @@ async function refresh() {
     return;
   }
   playing = lib.playing;
+  document.documentElement.classList.toggle("handheld", !!lib.handheld);
+  COLUMNS = lib.handheld ? 4 : 5;
   if (!lib.games.some((g) => g.path === selected)) selected = lib.games[0]?.path ?? null;
   render();
   loadAllCovers();

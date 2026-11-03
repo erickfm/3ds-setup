@@ -738,6 +738,31 @@ def steam_running():
     return False
 
 
+# Library artwork, by Steam's file name suffix. tools/make-steam-art.py draws them; releases
+# publish them as steam-<name>.
+STEAM_ART = {"portrait.png": "p", "wide.png": "", "hero.png": "_hero", "logo.png": "_logo"}
+
+
+def steam_art(grid_dir, appid, add=True):
+    """Put our artwork in a Steam user's grid folder (or take it out). Never fails the install."""
+    unsigned = appid & 0xFFFFFFFF  # Steam names the files by the unsigned app ID
+    for name, suffix in STEAM_ART.items():
+        dest = grid_dir / f"{unsigned}{suffix}.png"
+        if not add:
+            dest.unlink(missing_ok=True)
+            continue
+        try:
+            src = Path(__file__).resolve().parent.parent / "launcher/steam" / name  # from a checkout
+            if not src.exists():
+                src = INSTALL_DIR / "steam-art" / name
+                if not src.exists():
+                    download(f"{OUR_RELEASE}/steam-{name}", src)
+            grid_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+        except Exception as e:
+            log(f"couldn't add Steam artwork {name}: {e!r}")
+
+
 def steam_shortcut(add=True):
     """Add 3DS to the Steam library (or take it out). Steam keeps the list in memory and writes
     it back on exit, so it has to be closed while we change the file. Returns True if done."""
@@ -767,6 +792,10 @@ def steam_shortcut(add=True):
         if add:  # refresh our entry, keeping what Steam learned about it
             keep = {k: mine[0][k] for k in ("LastPlayTime", "IsHidden", "tags") if mine and k in mine[0]}
             others.append({**entry, **keep})
+        for v in mine:  # artwork of an older entry (its app ID changes with its path)
+            if isinstance(v.get("appid"), int) and v["appid"] != appid:
+                steam_art(user / "config/grid", v["appid"], add=False)
+        steam_art(user / "config/grid", appid, add)
         data["shortcuts"] = {str(i): v for i, v in enumerate(others)}
         new = vdf_dump(data)
         if new != old:

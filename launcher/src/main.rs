@@ -321,6 +321,7 @@ struct Library {
     fullscreen: bool,
     azahar_ready: bool,
     playing: Option<String>,
+    handheld: bool,
 }
 
 fn ms(t: SystemTime) -> u64 {
@@ -346,10 +347,42 @@ fn play_times(p: &Paths) -> HashMap<u64, u64> {
         .collect()
 }
 
+/// Where else to look for games, besides the games folder: the usual download spots, EmuDeck's
+/// folder, and (on Linux) memory cards and USB drives, such as a Steam Deck's microSD card.
+fn scan_places(p: &Paths) -> Vec<(PathBuf, u32)> {
+    let mut places = vec![
+        (p.home.join("Downloads"), 2),
+        (p.home.join("Desktop"), 2),
+        (p.home.join("Games"), 3),
+        (p.home.join("Emulation/roms"), 2),
+    ];
+    #[cfg(target_os = "linux")]
+    {
+        let user = p.home.file_name().map(|n| n.to_owned()).unwrap_or_default();
+        for media in [PathBuf::from("/run/media").join(&user), PathBuf::from("/run/media"), PathBuf::from("/media").join(&user)] {
+            for drive in std::fs::read_dir(&media).into_iter().flatten().flatten() {
+                let path = drive.path();
+                if path.is_dir() && path.file_name() != Some(user.as_os_str()) {
+                    places.push((path, 3));
+                }
+            }
+        }
+    }
+    places
+}
+
+/// Folders that are big and never hold 3DS games, so scanning skips them.
+const SKIP_DIRS: &[&str] = &["steamapps", "SteamLibrary", "compatdata", "shadercache", "node_modules", "lost+found"];
+
 fn find_games(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let path = e.path();
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+            continue;
+        }
         if path.is_dir() {
             if depth > 0 {
                 find_games(&path, depth - 1, out);
@@ -406,6 +439,11 @@ fn scan(p: &Paths, playing: Option<String>) -> Library {
 
     let mut files = Vec::new();
     find_games(&cfg.games_dir, 3, &mut files);
+    for (dir, depth) in scan_places(p) {
+        find_games(&dir, depth, &mut files);
+    }
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|f| seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())));
     let mut found: Vec<(PathBuf, games::RomInfo, &'static str)> = files
         .into_iter()
         .map(|f| {
@@ -414,6 +452,9 @@ fn scan(p: &Paths, playing: Option<String>) -> Library {
             (f, info, kind)
         })
         .collect();
+    // The same game found in two places shows once (the games folder's copy, found first).
+    let mut ids = std::collections::HashSet::new();
+    found.retain(|g| g.2 != "game" || g.1.title_id.is_none_or(|t| ids.insert(t)));
     let installed = installed_games(p);
     let have: Vec<u64> = found.iter().filter(|g| g.2 == "game").filter_map(|g| g.1.title_id).collect();
     let installed_ids: Vec<u64> = installed.iter().filter_map(|g| g.1.title_id).collect();
@@ -480,7 +521,31 @@ fn scan(p: &Paths, playing: Option<String>) -> Library {
         fullscreen: cfg.fullscreen,
         azahar_ready: p.azahar.exists(),
         playing,
+        handheld: handheld(),
     }
+}
+
+// ---------------------------------------------------------------- Steam Deck
+
+/// A Steam Deck (Valve hardware, or SteamOS), or THREEDS_HANDHELD=1 to try the layout elsewhere.
+/// It gets bigger text and a side-by-side layout that fills its wide, short screen.
+fn handheld() -> bool {
+    static IT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IT.get_or_init(|| {
+        if let Ok(v) = std::env::var("THREEDS_HANDHELD") {
+            return v == "1";
+        }
+        let read = |f: &str| std::fs::read_to_string(f).unwrap_or_default();
+        cfg!(target_os = "linux")
+            && (read("/sys/class/dmi/id/sys_vendor").trim() == "Valve"
+                || read("/etc/os-release").lines().any(|l| l == "ID=steamos"))
+    })
+}
+
+/// Running inside Steam's Gaming Mode, which shows one full-screen window at a time.
+fn gaming_mode() -> bool {
+    std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.eq_ignore_ascii_case("gamescope"))
 }
 
 // ---------------------------------------------------------------- commands
@@ -865,6 +930,22 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            if let Some(w) = app.get_webview_window("main") {
+                // Fill small screens (the Deck's is 1280x800) instead of overflowing them, and the
+                // whole screen in Gaming Mode. Sized explicitly too, in case nothing honors the request.
+                let screen = w.current_monitor().ok().flatten().map(|m| m.size().to_logical::<f64>(m.scale_factor()));
+                let small = screen.is_some_and(|s| s.width < 1200.0 || s.height < 900.0);
+                if gaming_mode() || handheld() || small {
+                    if let Some(s) = screen {
+                        let _ = w.set_size(tauri::LogicalSize::new(s.width, s.height));
+                        let _ = w.set_position(tauri::LogicalPosition::new(0.0, 0.0));
+                    }
+                    let _ = if gaming_mode() { w.set_fullscreen(true) } else { w.maximize() };
+                }
+            }
+            Ok(())
+        })
         .manage(Playing::default())
         .invoke_handler(tauri::generate_handler![
             library,

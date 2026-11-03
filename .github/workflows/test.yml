@@ -339,6 +339,7 @@ jobs:
           python3 -c "import json,sys; c=json.load(open(sys.argv[1])); assert c['controller'] is True" \
             "$HOME/.config/3ds-setup/config.json" && echo "ok: controller chosen without asking"
           grep -q '3ds-launcher' "$HOME/.local/share/Steam/userdata/12345/config/shortcuts.vdf" && echo "ok: in the Steam library"
+          test "$(ls "$HOME/.local/share/Steam/userdata/12345/config/grid/"*.png | wc -l)" -eq 4 && echo "ok: Steam artwork"
 
       - name: The 3DS app starts and stays up without system WebKitGTK
         env:

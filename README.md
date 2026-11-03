@@ -62,11 +62,14 @@ Open **3DS**.
 
 - **Your games show up by themselves** from the `3DS Games` folder, Downloads, Desktop, a `Games` folder, EmuDeck's `Emulation/roms`, and (on Linux) memory cards and USB drives, such as a Steam Deck's microSD card.
 - **Add games:** click **Add games** (or drag game files onto the window) to copy games into the `3DS Games` folder. Azahar needs decrypted game files (`.3ds`, `.cci`, `.cxi`, `.cia`, `.3dsx`, or the compressed `.zcci`/`.zcia`). Dump them from a 3DS you own ([how](https://azahar-emu.org/pages/faq/)). A `.cia` gets set up inside Azahar the first time you play it.
-- **Play:** click a game, then **Play** (or double-click it). The game opens in Azahar; close that window to come back. Arrow keys and Enter work too, and so does a controller (D-pad to choose, A to play).
+- **Play:** click a game, then **Play** (or double-click it). The game opens in Azahar; close that window to come back. Arrow keys and Enter work too.
+- **With a controller** (Xbox, PlayStation, Steam Deck...): D-pad or left stick to choose, **A** to play, **Y** for the game's older saves, **X** for all saves, **Start** (☰) for settings, **B** to go back. In settings, the D-pad moves between choices and **A** picks one.
 - **Controller:** plug it in before you start a game. Buttons go by their letters: the controller's A is the 3DS A, B is B, and so on.
 - **Steam Deck:** **A**, **B**, **X** and **Y** are the same buttons as on a 3DS. **L1/R1** are L and R, **L2/R2** are ZL and ZR, **☰** is Start and **⧉** is Select. The left stick is the Circle Pad, and you tap the touchscreen for the bottom screen.
 - **Saves back up automatically** every few minutes while you play, and again when you stop. Each game shows when it was last saved and whether that save is backed up.
 - **Box art** for each game is downloaded from [GameTDB](https://www.gametdb.com) the first time it's shown.
+- **Game settings** in Settings (the gear): sharpness (3× by default), screen layout, swap screens, and how fast speed-up runs. Everything else is in Azahar's own settings.
+- **Keyboard keys in a game:** **Tab** speed up on/off, **F1** quick save, **F2** quick load, **F9** swap screens, **F10** screen layout, **F11** full screen, **F4** pause. On a Steam Deck, set a back button to one of these in Steam's controller settings (in Gaming Mode: 3DS → controller icon → Edit layout → Back grip buttons).
 - **Dark mode** follows your computer; pick Light or Dark in Settings (the gear) to override it.
 - **Save states:** every 10 minutes your game also gets a save state. To jump back to the newest one, press **Ctrl+V** (**⌘V** on a Mac). You can change or turn this off in Settings (the gear).
 
@@ -126,7 +129,7 @@ Azahar has no timer for save states, so the watcher presses that hotkey for you.
 
 ### What setup changes in Azahar
 
-It adds the `3DS Games` folder to the game list. If you chose a controller and Azahar has no button mapping yet, it also sets up a controller profile that works with any controller, with each button matching its letter (A is A). An existing mapping is never touched.
+It adds the `3DS Games` folder to the game list, sets 3× resolution, and gives speed-up, quick save and quick load single keys (Tab, F1, F2; Load Amiibo moves to Ctrl+F2). Settings you've changed yourself are left alone. If you chose a controller and Azahar has no button mapping yet, it also sets up a controller profile that works with any controller, with each button matching its letter (A is A). An existing mapping is never touched.
 
 ### The 3DS app
 

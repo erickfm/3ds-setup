@@ -623,6 +623,31 @@ def controller_profile():
     return p
 
 
+# Azahar settings we start people on. Only ones still at Azahar's own default are changed, so
+# anything set by hand stays. Keep in step with $AzaharDefaults in 3ds-setup.ps1 and the README.
+AZAHAR_DEFAULTS = {
+    "Renderer": {"resolution_factor": "3"},  # 3x native: sharp, and fine on a Steam Deck
+    # One key each for actions that have no controller button, so a Steam Deck's back buttons (or
+    # any controller remapper) can be set to press them.
+    "UI": {f"Shortcuts\\Main%20Window\\{name.replace(' ', '%20')}\\KeySeq": key for name, key in {
+        "Toggle Turbo Mode": "Tab",  # speed up on/off
+        "Quick Save": "F1",
+        "Quick Load": "F2",
+        "Load Amiibo": "Ctrl+F2",  # was F2
+    }.items()},
+}
+
+
+def untouched_items(lines, section, wanted):
+    """The wanted values whose setting is unset or still flagged as Azahar's default."""
+    items = {}
+    for key, value in wanted.items():
+        current = ini_get(lines, section, key)
+        if (current is None or ini_get(lines, section, key + "\\default") == "true") and current != value:
+            items[key] = value
+    return items
+
+
 def setup_azahar_config(cfg, use_controller, deck=False):
     """Point Azahar's game list at the games folder, and (fresh setups only) map a controller.
     On a Steam Deck, also replace a mapping that has no controller in it (Azahar's own keyboard
@@ -650,6 +675,12 @@ def setup_azahar_config(cfg, use_controller, deck=False):
         items["Paths\\gamedirs\\size"] = str(size)
         ini_set(lines, "UI", items)
         done.append("games folder")
+
+    for section, wanted in AZAHAR_DEFAULTS.items():
+        items = untouched_items(lines, section, wanted)
+        if items:
+            ini_set(lines, section, items)
+            done.append(section.lower() + " defaults")
 
     # Never replace a mapping someone already set up.
     no_mapping = ini_get(lines, "Controls", "profiles\\size") is None

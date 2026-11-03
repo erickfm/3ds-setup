@@ -4,6 +4,7 @@
 
 mod backups;
 mod games;
+mod pad;
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -52,6 +53,7 @@ struct Paths {
     config: PathBuf,
     azahar: PathBuf,
     azahar_data: PathBuf,
+    azahar_ini: PathBuf, // Azahar's settings (qt-config.ini)
     host: String,
     home: PathBuf,
     documents: PathBuf,
@@ -74,6 +76,7 @@ fn paths(app: &AppHandle) -> Paths {
             install_dir: local.join("3ds-setup"),
             config: roaming.join("3ds-setup").join("config.json"),
             azahar: azahar_dir.join("azahar.exe"),
+            azahar_ini: if portable.is_dir() { portable.join("config/qt-config.ini") } else { roaming.join("Azahar/config/qt-config.ini") },
             azahar_data: if portable.is_dir() { portable } else { roaming.join("Azahar") },
             host: std::env::var("COMPUTERNAME").unwrap_or_default(),
             home,
@@ -84,24 +87,27 @@ fn paths(app: &AppHandle) -> Paths {
     {
         let xdg_data = env_path("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share"));
         let xdg_config = env_path("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
-        let (install_dir, config, azahar, azahar_data);
+        let (install_dir, config, azahar, azahar_data, azahar_ini);
         if cfg!(target_os = "macos") {
             install_dir = home.join("Library/Application Support/3ds-setup");
             config = install_dir.join("config.json");
             azahar = home.join("Applications/Azahar.app/Contents/MacOS/azahar");
-            azahar_data = if xdg_data.join("azahar-emu").exists() || xdg_config.join("azahar-emu").exists() {
-                xdg_data.join("azahar-emu")
-            } else {
-                home.join("Library/Application Support/Azahar")
-            };
+            let xdg = xdg_data.join("azahar-emu").exists() || xdg_config.join("azahar-emu").exists();
+            azahar_data = if xdg { xdg_data.join("azahar-emu") } else { home.join("Library/Application Support/Azahar") };
+            azahar_ini = if xdg { xdg_config.join("azahar-emu") } else { azahar_data.join("config") }.join("qt-config.ini");
         } else {
             install_dir = xdg_data.join("3ds-setup");
             config = xdg_config.join("3ds-setup/config.json");
             azahar = install_dir.join("azahar.AppImage");
-            let flatpak = home.join(".var/app/org.azahar_emu.Azahar/data/azahar-emu");
-            azahar_data = if flatpak.is_dir() { flatpak } else { xdg_data.join("azahar-emu") };
+            let flatpak = home.join(".var/app/org.azahar_emu.Azahar");
+            let flatpak_data = flatpak.join("data/azahar-emu");
+            (azahar_data, azahar_ini) = if flatpak_data.is_dir() {
+                (flatpak_data, flatpak.join("config/azahar-emu/qt-config.ini"))
+            } else {
+                (xdg_data.join("azahar-emu"), xdg_config.join("azahar-emu/qt-config.ini"))
+            };
         }
-        Paths { install_dir, config, azahar, azahar_data, host: hostname(), home, documents }
+        Paths { install_dir, config, azahar, azahar_data, azahar_ini, host: hostname(), home, documents }
     }
 }
 
@@ -880,6 +886,91 @@ fn set_fullscreen(app: AppHandle, on: bool) -> Result<(), String> {
     set_config_value(&paths(&app), "launcher_fullscreen", json!(on))
 }
 
+// ---------------------------------------------------------------- Azahar's own settings
+
+/// The Azahar settings the 3DS app can change: name -> (section, key, Azahar's default, allowed).
+/// layout_option: 0 stacked, 1 one screen, 2 large top, 3 side by side, 5 hybrid.
+const EMU_SETTINGS: &[(&str, &str, &str, &str, &[&str])] = &[
+    ("resolution", "Renderer", "resolution_factor", "1", &["1", "2", "3", "4", "5", "6"]),
+    ("layout", "Layout", "layout_option", "0", &["0", "1", "2", "3", "5"]),
+    ("swap", "Layout", "swap_screen", "false", &["true", "false"]),
+    ("turbo", "Renderer", "turbo_limit", "200", &["150", "200", "300", "500"]),
+];
+
+/// (start, end) line range of [section]'s body.
+fn ini_section(lines: &[String], section: &str) -> Option<(usize, usize)> {
+    let header = format!("[{section}]");
+    let start = lines.iter().position(|l| l.trim() == header)? + 1;
+    let end = lines[start..].iter().position(|l| l.starts_with('[')).map_or(lines.len(), |i| start + i);
+    Some((start, end))
+}
+
+fn ini_value(lines: &[String], section: &str, key: &str) -> Option<String> {
+    let (start, end) = ini_section(lines, section)?;
+    let prefix = format!("{key}=");
+    lines[start..end].iter().find_map(|l| l.strip_prefix(&prefix)).map(|v| v.trim().to_string())
+}
+
+#[tauri::command]
+fn emu_settings(app: AppHandle) -> HashMap<String, String> {
+    let p = paths(&app);
+    let text = std::fs::read_to_string(&p.azahar_ini).unwrap_or_default();
+    let lines: Vec<String> = text.lines().map(String::from).collect();
+    EMU_SETTINGS
+        .iter()
+        .map(|(name, section, key, default, _)| {
+            // Azahar marks a setting it left at its default with key\default=true
+            let is_default = ini_value(&lines, section, &format!("{key}\\default")).as_deref() == Some("true");
+            let value = ini_value(&lines, section, key).filter(|_| !is_default).unwrap_or_else(|| default.to_string());
+            // "300.000000" style doubles from some versions
+            let value = value.parse::<f64>().map(|f| if f.fract() == 0.0 { format!("{}", f as i64) } else { value.clone() }).unwrap_or(value);
+            (name.to_string(), value)
+        })
+        .collect()
+}
+
+/// Change one of Azahar's settings. Azahar writes its settings back when it closes, so this
+/// waits until no game is running.
+#[tauri::command]
+fn set_emu_setting(app: AppHandle, playing: State<'_, Playing>, name: String, value: String) -> Result<(), String> {
+    if playing.0.lock().unwrap().is_some() {
+        return Err("Close the game first, then change this.".into());
+    }
+    let (_, section, key, _, allowed) =
+        EMU_SETTINGS.iter().find(|s| s.0 == name).ok_or_else(|| format!("unknown setting {name}"))?;
+    if !allowed.contains(&value.as_str()) {
+        return Err(format!("{value} isn't a choice for {name}"));
+    }
+    let p = paths(&app);
+    let text = std::fs::read_to_string(&p.azahar_ini).unwrap_or_default();
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let (start, mut end) = ini_section(&lines, section).unwrap_or_else(|| {
+        lines.extend([String::new(), format!("[{section}]")]);
+        (lines.len(), lines.len())
+    });
+    // drop the old value and its "default" flag, then add ours at the end of the section
+    let (plain, flag) = (format!("{key}="), format!("{key}\\default="));
+    let mut i = start;
+    while i < end {
+        if lines[i].starts_with(&plain) || lines[i].starts_with(&flag) {
+            lines.remove(i);
+            end -= 1;
+        } else {
+            i += 1;
+        }
+    }
+    while end > start && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    lines.insert(end, format!("{key}={value}"));
+    if let Some(dir) = p.azahar_ini.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = p.azahar_ini.with_extension("ini.partial");
+    std::fs::write(&tmp, lines.join("\n").trim_matches('\n').to_string() + "\n").map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p.azahar_ini).map_err(|e| e.to_string())
+}
+
 /// Point backups at a new folder (a "3DS-Backups" folder inside the one picked), bringing
 /// along this computer's existing backups. Nothing is deleted from the old folder.
 #[tauri::command]
@@ -931,6 +1022,7 @@ fn main() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            pad::start(app.handle().clone());
             if let Some(w) = app.get_webview_window("main") {
                 // Fill small screens (the Deck's is 1280x800) instead of overflowing them, and the
                 // whole screen in Gaming Mode. Sized explicitly too, in case nothing honors the request.
@@ -959,6 +1051,8 @@ fn main() {
             open_folder,
             set_autosave,
             set_fullscreen,
+            emu_settings,
+            set_emu_setting,
             set_backup_dir
         ])
         .run(tauri::generate_context!())

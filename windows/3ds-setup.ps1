@@ -556,6 +556,19 @@ function Get-ControllerProfile {
     return $p
 }
 
+# Azahar settings we start people on. Only ones still at Azahar's own default are changed, so
+# anything set by hand stays. Same as AZAHAR_DEFAULTS in 3ds-setup.py.
+$AzaharDefaults = [ordered]@{
+    Renderer = [ordered]@{ resolution_factor = '3' }  # 3x native
+    # One key each for actions that have no controller button, for controller remappers.
+    UI = [ordered]@{
+        'Shortcuts\Main%20Window\Toggle%20Turbo%20Mode\KeySeq' = 'Tab'  # speed up on/off
+        'Shortcuts\Main%20Window\Quick%20Save\KeySeq' = 'F1'
+        'Shortcuts\Main%20Window\Quick%20Load\KeySeq' = 'F2'
+        'Shortcuts\Main%20Window\Load%20Amiibo\KeySeq' = 'Ctrl+F2'  # was F2
+    }
+}
+
 function Set-AzaharConfig($cfg, [bool]$useController) {
     # Point Azahar's game list at the games folder, and (fresh setups only) map a controller.
     $ini = Join-Path (Get-AzaharUserDir) 'config\qt-config.ini'
@@ -582,6 +595,15 @@ function Set-AzaharConfig($cfg, [bool]$useController) {
         $items['Paths\gamedirs\size'] = "$size"
         Set-IniValues $lines 'UI' $items
         $changed = $true
+    }
+    foreach ($section in $AzaharDefaults.Keys) {
+        $items = [ordered]@{}
+        foreach ($key in $AzaharDefaults[$section].Keys) {
+            $want = $AzaharDefaults[$section][$key]
+            $current = Get-IniValue $lines $section $key
+            if (($null -eq $current -or (Get-IniValue $lines $section "$key\default") -eq 'true') -and $current -ne $want) { $items[$key] = $want }
+        }
+        if ($items.Count) { Set-IniValues $lines $section $items; $changed = $true }
     }
     # Never replace a mapping someone already set up.
     if ($useController -and $null -eq (Get-IniValue $lines 'Controls' 'profiles\size')) {

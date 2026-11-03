@@ -269,9 +269,8 @@ function renderGrid() {
 }
 
 function renderHints() {
-  const pad = [...(navigator.getGamepads?.() ?? [])].some(Boolean);
   $("hints").innerHTML = !lib.games.length ? `<span>Your games show up here</span>`
-    : pad ? `<span><span class="key">A</span>Play</span><span><span class="key">B</span>Back</span><span><span class="key">✚</span>Choose</span>`
+    : padCount ? `<span><span class="key">A</span>Play</span><span><span class="key">Y</span>Older saves</span><span><span class="key">X</span>All saves</span><span><span class="key">☰</span>Settings</span>`
     : `<span>Double-click a game to play</span><span><span class="key">⏎</span>Play</span><span><span class="key">←→</span>Choose</span>`;
 }
 
@@ -461,8 +460,20 @@ function confirmRestore(g, v) {
   };
 }
 
-function showSettings() {
+// Azahar's own settings that the app can change: [name, title, help, [[value, label], ...]]
+const EMU = [
+  ["resolution", "Sharpness", "How detailed games look. Higher is sharper but needs a faster computer; 3× suits most, a Steam Deck included.",
+    [["1", "1×"], ["2", "2×"], ["3", "3×"], ["4", "4×"], ["5", "5×"]]],
+  ["layout", "Screen layout", "How the two 3DS screens are arranged. F10 in a game switches between them.",
+    [["0", "Stacked"], ["3", "Side by side"], ["2", "Big top"], ["1", "One screen"], ["5", "Hybrid"]]],
+  ["swap", "Swap screens", "Show the bottom screen where the top one goes. F9 in a game does it too.", null],
+  ["turbo", "Speed-up", "How fast the game runs while sped up. Press Tab in a game to speed up and again to stop.",
+    [["150", "1.5×"], ["200", "2×"], ["300", "3×"], ["500", "5×"]]],
+];
+
+async function showSettings() {
   sound("open");
+  const emu = await invoke("emu_settings").catch(() => null);
   const b = lib.backup;
   const last = b.last ? `Last backup ${ago(stampDate(b.last))}` : "No backups yet";
   const auto = lib.autosave_minutes;
@@ -482,9 +493,29 @@ function showSettings() {
         <button class="switch${pref.get("sounds", true) ? " on" : ""}" id="s-sound" aria-label="Sounds"></button></div>
       <div class="setting"><div class="label"><b>Games folder</b><span class="path">${esc(lib.games_dir)}</span></div>
         <div class="btns"><button class="btn" id="s-games-open">Open</button></div></div>
-      <div class="setting"><div class="label"><b>Controls and graphics</b><span>Change buttons, screen layout and more in Azahar's own settings (Emulation &gt; Configure).</span></div>
+      ${emu ? `<h3 class="settings-group">Game settings</h3>${playing ? `<p class="settings-note">Close the game to change these.</p>` : ""}
+      ${EMU.map(([name, title, help, choices]) => `<div class="setting"><div class="label"><b>${title}</b><span>${help}</span></div>
+        ${choices
+          ? `<div class="seg">${choices.map(([v, label]) => `<button data-emu="${name}" data-value="${v}" class="${emu[name] === v ? "on" : ""}"${playing ? " disabled" : ""}>${label}</button>`).join("")}</div>`
+          : `<button class="switch${emu[name] === "true" ? " on" : ""}" data-emu-switch="${name}" aria-label="${title}"${playing ? " disabled" : ""}></button>`}</div>`).join("")}` : ""}
+      <div class="setting"><div class="label"><b>Keyboard keys in a game</b><span>Handy for a Steam Deck's back buttons: set one to a key in Steam's controller settings.</span>
+        <span class="keys"><b>Tab</b> speed up · <b>F1</b> quick save · <b>F2</b> quick load · <b>F9</b> swap screens · <b>F10</b> screen layout · <b>F11</b> full screen · <b>F4</b> pause</span></div></div>
+      <div class="setting"><div class="label"><b>Controls and everything else</b><span>Change buttons and more in Azahar's own settings (Emulation &gt; Configure).</span></div>
         <div class="btns"><button class="btn" id="s-azahar">Open Azahar</button></div></div>
     </div>`);
+  document.querySelectorAll("[data-emu]").forEach((btn) => (btn.onclick = async () => {
+    try { await invoke("set_emu_setting", { name: btn.dataset.emu, value: btn.dataset.value }); }
+    catch (e) { return toast(String(e), 4000); }
+    document.querySelectorAll(`[data-emu="${btn.dataset.emu}"]`).forEach((x) => x.classList.toggle("on", x === btn));
+    sound("move");
+  }));
+  document.querySelectorAll("[data-emu-switch]").forEach((sw) => (sw.onclick = async () => {
+    const on = !sw.classList.contains("on");
+    try { await invoke("set_emu_setting", { name: sw.dataset.emuSwitch, value: String(on) }); }
+    catch (e) { return toast(String(e), 4000); }
+    sw.classList.toggle("on", on);
+    sound("move");
+  }));
   $("s-backup-now").onclick = async (ev) => {
     ev.currentTarget.disabled = true;
     try { await invoke("backup_now"); sound("done"); toast("Backed up! Your saves are safe."); }
@@ -573,34 +604,59 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "Enter" && document.activeElement?.tagName !== "BUTTON") play(current());
 });
 
-// Controllers: D-pad / left stick to choose, A to play, B to close.
-const padHeld = {};
-let padRepeat = 0;
-function pollPads() {
-  const pad = [...(navigator.getGamepads?.() ?? [])].find(Boolean);
-  if (pad) {
-    const ax = pad.axes[0] ?? 0, ay = pad.axes[1] ?? 0;
-    const dir = pad.buttons[14]?.pressed || ax < -0.5 ? -1 : pad.buttons[15]?.pressed || ax > 0.5 ? 1
-      : pad.buttons[12]?.pressed || ay < -0.5 ? -COLUMNS : pad.buttons[13]?.pressed || ay > 0.5 ? COLUMNS : 0;
-    const now = performance.now();
-    if (dir && (padHeld.dir !== dir || now > padRepeat)) {
-      move(dir);
-      padRepeat = now + (padHeld.dir === dir ? 140 : 380);
-    }
-    padHeld.dir = dir;
-    for (const [i, action] of [[0, "a"], [1, "b"], [9, "a"]]) {
-      const down = pad.buttons[i]?.pressed;
-      if (down && !padHeld[i]) {
-        if (action === "b" && modalOpen && !$("modal").dataset.locked) closeModal();
-        if (action === "a") modalOpen ? document.activeElement?.click() : play(current());
-      }
-      padHeld[i] = down;
-    }
+// Controllers come from the app (native, see pad.rs) as "pad" events, by button position:
+// D-pad / left stick to move, A to play or press, B to go back, Y for the selected game's older
+// saves, X for all saves, Start (☰) for settings. Held directions repeat.
+let padCount = 0;
+let padTimer = null;
+listen("pads", ({ payload }) => { padCount = payload; if (lib) renderHints(); });
+listen("pad", ({ payload: { button, down } }) => {
+  const dir = ["up", "down", "left", "right"].includes(button);
+  if (dir && !down) { clearTimeout(padTimer); padTimer = null; return; }
+  if (!down || playing || document.hidden) return;
+  document.documentElement.classList.add("pad-nav");
+  if (dir) {
+    clearTimeout(padTimer);
+    const step = () => (modalOpen ? focusStep(button) : move({ left: -1, right: 1, up: -COLUMNS, down: COLUMNS }[button]));
+    step();
+    const again = (ms) => (padTimer = setTimeout(() => { step(); again(130); }, ms));
+    again(380);
+    return;
   }
-  requestAnimationFrame(pollPads);
+  if (modalOpen) {
+    if (button === "a") document.activeElement?.click();
+    if (button === "b" && !$("modal").dataset.locked) closeModal();
+    return;
+  }
+  const g = current();
+  if (button === "a") play(g);
+  else if (button === "y" && g?.title_id) showVersions(g, false);
+  else if (button === "x" && lib) showSavesList();
+  else if (button === "start" && lib) showSettings();
+});
+// the focus ring is for controller use; the mouse doesn't need it
+document.addEventListener("pointerdown", () => document.documentElement.classList.remove("pad-nav"));
+
+/** Move the focus inside a dialog to the nearest thing in that direction. */
+function focusStep(dir) {
+  const items = [...$("modal-body").querySelectorAll('button:not([disabled]), [tabindex="0"]')].filter((el) => el.offsetParent);
+  const cur = document.activeElement;
+  if (!items.includes(cur)) { items[0]?.focus(); return; }
+  const center = (el) => { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2, r.height]; };
+  const [cx, cy, ch] = center(cur);
+  const vertical = dir === "up" || dir === "down";
+  const sign = dir === "up" || dir === "left" ? -1 : 1;
+  let best = null, bestScore = Infinity;
+  for (const el of items) {
+    if (el === cur) continue;
+    const [x, y] = center(el);
+    const along = (vertical ? y - cy : x - cx) * sign, across = Math.abs(vertical ? x - cx : y - cy);
+    if (along < 4 || (!vertical && across > ch)) continue;  // left/right stays on the same row
+    const score = along + across * 3;
+    if (score < bestScore) { best = el; bestScore = score; }
+  }
+  if (best) { best.focus(); best.scrollIntoView({ block: "nearest" }); sound("move"); }
 }
-window.addEventListener("gamepadconnected", () => lib && renderHints());
-window.addEventListener("gamepaddisconnected", () => lib && renderHints());
 
 // ---------------------------------------------------------------- wiring
 
@@ -652,4 +708,3 @@ setInterval(() => !modalOpen && !document.hidden && refresh(), 60_000);
 
 $("stage").innerHTML = `<div class="center-card"><div class="spinner"></div></div>`;
 refresh();
-requestAnimationFrame(pollPads);

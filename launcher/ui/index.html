@@ -20,6 +20,7 @@
     <symbol id="i-close" viewBox="0 0 24 24"><path d="m6.5 6.5 11 11m0-11-11 11" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
     <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 6 8.5 12l6 6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9.5 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 19.5h14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-box" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9z M4 7.5l8 4.5 8-4.5M12 12v9" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
   </svg>
 
@@ -28,7 +29,8 @@
     <section class="screen top" id="top">
       <div class="backdrop" id="backdrop"></div>
       <header class="statusbar">
-        <span class="pill" id="backup-pill"><span class="dot"></span><span id="backup-text">Backups</span></span>
+        <span class="pill" id="backup-pill" tabindex="0"><span class="dot"></span><span id="backup-text">Backups</span></span>
+        <button class="pill update" id="update-pill" hidden title="Update 3DS"><svg><use href="#i-download"/></svg><span>Update available</span></button>
         <span class="spacer"></span>
         <span id="date"></span>
         <span id="clock"></span>

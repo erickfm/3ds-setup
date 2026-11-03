@@ -3,6 +3,7 @@
 
 Commands:
   install    download/update Azahar, pick a backup folder, start the background watcher
+  update     install again with no questions (what the 3DS app's Update button runs)
   watch      background loop: while Azahar runs, back up saves and auto save-state
   backup     back up right now
   restore    pick a backup to bring back (or: restore <number> [--game ID])
@@ -189,6 +190,7 @@ def download(url, dest, sha256=None):
 # macOS gets real dialog windows; Linux uses the terminal.
 
 QUIET = False  # --quiet: never show dialogs (used by CI)
+UPDATING = False  # the update command: the 3DS app is waiting on this
 
 
 def osascript(script, *args):
@@ -624,9 +626,12 @@ def controller_profile():
 
 
 # Azahar settings we start people on. Only ones still at Azahar's own default are changed, so
-# anything set by hand stays. Keep in step with $AzaharDefaults in 3ds-setup.ps1 and the README.
+# anything set by hand stays, and each is offered only once (see setup_azahar_config). Keep in
+# step with $AzaharDefaults in 3ds-setup.ps1 and the README.
 AZAHAR_DEFAULTS = {
-    "Renderer": {"resolution_factor": "3"},  # 3x native: sharp, and fine on a Steam Deck
+    # 3x the 3DS's own resolution: clean on a big screen, and fine on a Steam Deck. Speed-up
+    # runs at 1.5x (Azahar's 2x is too fast to play at).
+    "Renderer": {"resolution_factor": "3", "turbo_limit": "150"},
     # One key each for actions that have no controller button, so a Steam Deck's back buttons (or
     # any controller remapper) can be set to press them.
     "UI": {f"Shortcuts\\Main%20Window\\{name.replace(' ', '%20')}\\KeySeq": key for name, key in {
@@ -655,6 +660,7 @@ def setup_azahar_config(cfg, use_controller, deck=False):
     _, config_dir = azahar_dirs()
     ini = config_dir / "qt-config.ini"
     lines = ini.read_text(encoding="utf-8").splitlines() if ini.exists() else []
+    azahar_used = bool(lines)
     done = []
 
     games = Path(cfg["games_dir"]).as_posix()
@@ -676,11 +682,21 @@ def setup_azahar_config(cfg, use_controller, deck=False):
         ini_set(lines, "UI", items)
         done.append("games folder")
 
+    # Each default is offered once; after that the setting is yours. (Azahar flags a value as its
+    # default whenever it equals its own, so a 2x speed-up picked later would look untouched.)
+    if "azahar_defaults_applied" not in cfg:
+        # Setups before v1.6.0 offered all but the speed-up already.
+        cfg["azahar_defaults_applied"] = [] if not azahar_used else [
+            f"{section}/{key}" for section, wanted in AZAHAR_DEFAULTS.items() for key in wanted
+            if key != "turbo_limit"]
+    applied = cfg["azahar_defaults_applied"]
     for section, wanted in AZAHAR_DEFAULTS.items():
-        items = untouched_items(lines, section, wanted)
+        offer = {k: v for k, v in wanted.items() if f"{section}/{k}" not in applied}
+        items = untouched_items(lines, section, offer)
         if items:
             ini_set(lines, section, items)
             done.append(section.lower() + " defaults")
+        applied += [f"{section}/{k}" for k in offer]
 
     # Never replace a mapping someone already set up.
     no_mapping = ini_get(lines, "Controls", "profiles\\size") is None
@@ -1081,19 +1097,22 @@ def install_launcher():
         return True
     if src.name.endswith(".AppImage"):
         return install_launcher_appimage(src, keep=local)
+    new_bin, new_icon = (dest.with_name(dest.name + ".partial") for dest in (LAUNCHER_BIN, LAUNCHER_ICON))
     with tarfile.open(src) as tar:
-        for name, dest in (("3ds-launcher", LAUNCHER_BIN), ("3ds.png", LAUNCHER_ICON)):
-            tmp = dest.with_name(dest.name + ".partial")
+        for name, tmp in (("3ds-launcher", new_bin), ("3ds.png", new_icon)):
             with tar.extractfile(name) as f, open(tmp, "wb") as out:
                 shutil.copyfileobj(f, out)
-            os.replace(tmp, dest)
+    os.replace(new_icon, LAUNCHER_ICON)
     if not local:
         src.unlink()
-    LAUNCHER_BIN.chmod(0o755)
-    missing = subprocess.run(["ldd", str(LAUNCHER_BIN)], capture_output=True, text=True).stdout
+    new_bin.chmod(0o755)
+    # Check it can run here before it replaces the installed one.
+    missing = subprocess.run(["ldd", str(new_bin)], capture_output=True, text=True).stdout
     missing = [line.split()[0] for line in missing.splitlines() if "not found" in line]
     if not missing:
+        os.replace(new_bin, LAUNCHER_BIN)
         return True
+    new_bin.unlink()
     # No WebKitGTK here (SteamOS, for one): use the bigger build that brings its own.
     log(f"3DS app is missing {', '.join(missing)}; using the self-contained version")
     try:
@@ -1105,7 +1124,6 @@ def install_launcher():
         return install_launcher_appimage(appimage, keep="THREEDS_LAUNCHER_APPIMAGE" in os.environ)
     print(f"\nThe 3DS app needs some system libraries this computer doesn't have ({', '.join(missing)}).\n"
           "On Ubuntu/Debian: sudo apt install libwebkit2gtk-4.1-0   (then run the install again)")
-    LAUNCHER_BIN.unlink()
     return False
 
 
@@ -1310,7 +1328,11 @@ def cmd_install(args):
         print("(Azahar is open, so its settings were left alone. Re-run install after closing it.)")
     else:
         setup_azahar_config(cfg, cfg["controller"], deck)
+        save_config(cfg)  # which defaults were offered
     launcher = install_launcher()
+    if UPDATING and not launcher:
+        # The 3DS app asked for this, so leave it as it was and say so.
+        sys.exit("Couldn't update the 3DS app. Check that you're online, then try again.")
     install_helpers(me, launcher)
     start_watcher_at_login(me)
     in_steam = deck and not QUIET and steam_shortcut()
@@ -1342,6 +1364,15 @@ def cmd_install(args):
               "(Accessibility). Allow it in System Settings > Privacy & Security > Accessibility.")
     elif not deck and not shutil.which("xdotool"):  # SteamOS can't apt install
         print("Install xdotool for auto save-states:  sudo apt install xdotool")
+
+
+def cmd_update(args):
+    """What the 3DS app runs (with this release's script) to update everything: install again,
+    with no questions or dialogs, leaving a running 3DS app open (it restarts itself after)."""
+    global QUIET, UPDATING
+    QUIET = UPDATING = True
+    args.backup_dir = args.controller = None
+    cmd_install(args)
 
 
 def cmd_uninstall(args):
@@ -1426,6 +1457,7 @@ def main():
     i = sub.add_parser("install")
     i.add_argument("--backup-dir")
     i.add_argument("--controller", choices=["yes", "no"], help="set Azahar up for a game controller")
+    sub.add_parser("update", help="install again without questions (the 3DS app's Update button)")
     sub.add_parser("watch")
     sub.add_parser("backup")
     r = sub.add_parser("restore")
@@ -1438,7 +1470,7 @@ def main():
     flags = [a for a in argv if a in ("--quiet", "--pause")]  # allowed before or after the command
     args = p.parse_args(flags + [a for a in argv if a not in flags])
     QUIET = args.quiet or bool(os.environ.get("CI"))
-    commands = {"install": cmd_install, "watch": cmd_watch, "backup": cmd_backup,
+    commands = {"install": cmd_install, "update": cmd_update, "watch": cmd_watch, "backup": cmd_backup,
                 "restore": cmd_restore, "status": cmd_status, "uninstall": cmd_uninstall}
     try:
         commands[args.cmd](args)
@@ -1457,3 +1489,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# end of 3ds-setup (the 3DS app checks for this line to know an update downloaded in full)

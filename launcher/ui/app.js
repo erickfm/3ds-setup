@@ -13,6 +13,7 @@ let selected = null;   // path of the selected game
 let playing = null;    // name of the game running in Azahar
 let modalOpen = false;
 let onModalClose = null;
+let update = null;     // { current, latest, available } once checked
 const covers = new Map(); // product code -> box art data: URL, or null if there's none
 
 // ---------------------------------------------------------------- little helpers
@@ -178,6 +179,9 @@ function setBackdrop(url) {
 function renderStage(quiet) {
   const stage = $("stage");
   const g = current();
+  const had = stage.contains(document.activeElement) ? document.activeElement.id : null;
+  if (had) queueMicrotask(() => [$(had), $("btn-play"), $("welcome-add"), selectedTile()]
+    .find((el) => el && !el.disabled)?.focus({ preventScroll: true }));
   if (!quiet) {
     stage.style.animation = "none";
     void stage.offsetWidth; // restart the little entrance animation
@@ -247,6 +251,7 @@ function renderStage(quiet) {
 
 function renderGrid() {
   const grid = $("grid");
+  const had = grid.contains(document.activeElement) ? (document.activeElement.id === "slot-add" ? "add" : "tile") : null;
   const tiles = lib.games.map((g, i) => {
     let badge = "";
     if (g.encrypted) badge = `<span class="badge bad">${icon("warn")}</span>`;
@@ -266,12 +271,16 @@ function renderGrid() {
   });
   $("slot-add").onclick = pickGames;
   grid.querySelector(".selected")?.scrollIntoView({ block: "nearest" });
+  if (had) (had === "add" ? $("slot-add") : selectedTile() ?? $("slot-add")).focus({ preventScroll: true });
 }
 
 function renderHints() {
-  $("hints").innerHTML = !lib.games.length ? `<span>Your games show up here</span>`
-    : padCount ? `<span><span class="key">A</span>Play</span><span><span class="key">Y</span>Older saves</span><span><span class="key">X</span>All saves</span><span><span class="key">☰</span>Settings</span>`
-    : `<span>Double-click a game to play</span><span><span class="key">⏎</span>Play</span><span><span class="key">←→</span>Choose</span>`;
+  const key = (k, what) => `<span><span class="key">${k}</span>${what}</span>`;
+  const off = document.activeElement && !document.activeElement.dataset?.i && mainItems().includes(document.activeElement);
+  $("hints").innerHTML = padCount && off ? key("A", "Select") + key("B", "Back to games") + key("☰", "Settings")
+    : !lib.games.length ? `<span>Your games show up here</span>`
+    : padCount ? key("A", "Play") + key("Y", "Older saves") + key("X", "All saves") + key("☰", "Settings")
+    : `<span>Double-click a game to play</span>${key("⏎", "Play")}${key("←→", "Choose")}`;
 }
 
 function select(path, quiet) {
@@ -285,13 +294,6 @@ function select(path, quiet) {
     el.setAttribute("aria-selected", on);
     if (on) el.scrollIntoView({ block: "nearest" });
   });
-}
-
-function move(delta) {
-  if (!lib?.games.length || modalOpen || playing) return;
-  const i = Math.max(0, lib.games.findIndex((g) => g.path === selected));
-  const next = Math.min(lib.games.length - 1, Math.max(0, i + delta));
-  select(lib.games[next].path);
 }
 
 // ---------------------------------------------------------------- actions
@@ -351,8 +353,8 @@ function saveStatus(g) {
   return { cls: "", text: "No save yet" };
 }
 
-function showSavesList() {
-  sound("open");
+function showSavesList(refocus) {
+  if (!refocus) sound("open");
   const games = lib.games.filter((g) => g.title_id);
   games.sort((a, b) => (b.last_saved ?? 0) - (a.last_saved ?? 0));
   const b = lib.backup;
@@ -373,7 +375,7 @@ function showSavesList() {
       ${rows.length ? `<p>Pick a game to see every version of its save, and go back to any of them.</p><div class="rows">${rows.join("")}</div>`
         : `<div class="empty">No games with saves yet.<br>Play something and it shows up here.</div>`}
     </div>
-    <div class="modal-foot"><button class="btn" id="saves-open">${icon("folder")} Open backups folder</button><button class="btn" id="saves-now">Back up now</button></div>`);
+    <div class="modal-foot"><button class="btn" id="saves-open">${icon("folder")} Open backups folder</button><button class="btn" id="saves-now">Back up now</button></div>`, { focus: refocus || "[data-g]" });
   $("modal-body").querySelectorAll("[data-g]").forEach((el) => {
     const open = () => showVersions(games[+el.dataset.g], true);
     el.onclick = open;
@@ -385,7 +387,7 @@ function showSavesList() {
     try { await invoke("backup_now"); sound("done"); toast("Backed up! Your saves are safe."); }
     catch (e) { toast(`Backup failed: ${e}`, 5000); }
     await refresh();
-    if (modalOpen) showSavesList();
+    if (modalOpen) showSavesList("#saves-now");
   };
 }
 
@@ -403,7 +405,7 @@ async function showVersions(g, fromList) {
   const lead = fromList ? `<button class="back" id="v-back" title="All saves">${icon("back")}</button>` : "";
   const head = `<div class="modal-head">${lead}<span class="mini">${art(g)}</span><h2>${esc(g.name)}</h2>
     <button class="x" data-close title="Close">${icon("close")}</button></div>`;
-  const wireBack = () => { if (fromList) $("v-back").onclick = showSavesList; };
+  const wireBack = () => { if (fromList) $("v-back").onclick = () => showSavesList(); };
   openModal(`${head}<div class="modal-body"><div class="spinner"></div></div>`);
   wireBack();
   let versions;
@@ -416,7 +418,8 @@ async function showVersions(g, fromList) {
   if (!versions.length) {
     $("modal-body").innerHTML = `${head}<div class="modal-body"><div class="empty">No backups of ${esc(g.name)} yet.<br>They're made automatically while you play.</div></div>`;
     $("modal-body").querySelector("[data-close]").onclick = closeModal;
-    return wireBack();
+    wireBack();
+    return ($("v-back") || $("modal-body").querySelector("[data-close]")).focus();
   }
   let html = "", lastDay = "";
   versions.forEach((v, i) => {
@@ -437,6 +440,7 @@ async function showVersions(g, fromList) {
   $("modal-body").querySelector("[data-close]").onclick = closeModal;
   wireBack();
   $("modal-body").querySelectorAll("[data-v]").forEach((b) => (b.onclick = () => confirmRestore(g, versions[+b.dataset.v])));
+  ($("modal-body").querySelector("[data-v]") || $("modal-body").querySelector("[data-close]")).focus();
 }
 
 function confirmRestore(g, v) {
@@ -462,7 +466,7 @@ function confirmRestore(g, v) {
 
 // Azahar's own settings that the app can change: [name, title, help, [[value, label], ...]]
 const EMU = [
-  ["resolution", "Sharpness", "How detailed games look. Higher is sharper but needs a faster computer; 3× suits most, a Steam Deck included.",
+  ["resolution", "Render resolution", "Draws games at this many times the 3DS's own resolution (1× is 400×240), for cleaner edges and text on a big screen. Higher needs a faster computer; 3× suits most, a Steam Deck included.",
     [["1", "1×"], ["2", "2×"], ["3", "3×"], ["4", "4×"], ["5", "5×"]]],
   ["layout", "Screen layout", "How the two 3DS screens are arranged. F10 in a game switches between them.",
     [["0", "Stacked"], ["3", "Side by side"], ["2", "Big top"], ["1", "One screen"], ["5", "Hybrid"]]],
@@ -471,8 +475,8 @@ const EMU = [
     [["150", "1.5×"], ["200", "2×"], ["300", "3×"], ["500", "5×"]]],
 ];
 
-async function showSettings() {
-  sound("open");
+async function showSettings(refocus) {
+  if (!refocus) sound("open");
   const emu = await invoke("emu_settings").catch(() => null);
   const b = lib.backup;
   const last = b.last ? `Last backup ${ago(stampDate(b.last))}` : "No backups yet";
@@ -502,7 +506,20 @@ async function showSettings() {
         <span class="keys"><b>Tab</b> speed up · <b>F1</b> quick save · <b>F2</b> quick load · <b>F9</b> swap screens · <b>F10</b> screen layout · <b>F11</b> full screen · <b>F4</b> pause</span></div></div>
       <div class="setting"><div class="label"><b>Controls and everything else</b><span>Change buttons and more in Azahar's own settings (Emulation &gt; Configure).</span></div>
         <div class="btns"><button class="btn" id="s-azahar">Open Azahar</button></div></div>
-    </div>`);
+      <div class="setting"><div class="label"><b>Updates</b><span>${esc(updateText())}</span></div>
+        <div class="btns">${update?.available
+          ? `<button class="btn primary" id="s-update">${icon("download")} Update</button>`
+          : `<button class="btn" id="s-check">Check now</button>`}</div></div>
+    </div>`, { focus: refocus || "#s-backup-now" });
+  $("modal-body").dataset.kind = "settings";
+  if ($("s-update")) $("s-update").onclick = runUpdate;
+  if ($("s-check")) $("s-check").onclick = async (ev) => {
+    ev.currentTarget.disabled = true;
+    ev.currentTarget.textContent = "Checking...";
+    await checkUpdate();
+    if (!update?.latest) toast("Couldn't check for updates. Are you online?");
+    if (modalOpen) showSettings(update?.available ? "#s-update" : "#s-check");
+  };
   document.querySelectorAll("[data-emu]").forEach((btn) => (btn.onclick = async () => {
     try { await invoke("set_emu_setting", { name: btn.dataset.emu, value: btn.dataset.value }); }
     catch (e) { return toast(String(e), 4000); }
@@ -521,7 +538,7 @@ async function showSettings() {
     try { await invoke("backup_now"); sound("done"); toast("Backed up! Your saves are safe."); }
     catch (e) { toast(`Backup failed: ${e}`, 5000); }
     await refresh();
-    if (modalOpen) showSettings();
+    if (modalOpen) showSettings("#s-backup-now");
   };
   $("s-backup-dir").onclick = async () => {
     const folder = await dialog.open({ directory: true, title: "Where should your save backups go?" });
@@ -531,7 +548,7 @@ async function showSettings() {
       toast(`Backups now go to ${dir}`, 4500);
     } catch (e) { return showMessage("Couldn't use that folder", String(e)); }
     await refresh();
-    showSettings();
+    showSettings("#s-backup-dir");
   };
   $("s-backup-open").onclick = () => invoke("open_folder", { which: "backups" });
   $("s-games-open").onclick = () => invoke("open_folder", { which: "games" });
@@ -561,6 +578,58 @@ async function showSettings() {
   };
 }
 
+// ---------------------------------------------------------------- updates
+
+async function checkUpdate() {
+  let found;
+  try { found = await invoke("check_update"); } catch { return; }
+  if (!found.latest && update?.available) return; // offline now: keep the update found earlier
+  update = found;
+  $("update-pill").hidden = !update.available;
+  $("update-pill").title = update.latest ? `Update to ${update.latest}` : "Update 3DS";
+}
+
+function updateText() {
+  if (!update?.latest) return "3DS checks for a newer version each time it starts.";
+  if (update.available) return `${update.latest} is out${update.current ? ` (you have ${update.current})` : ""}.`;
+  return `You have the newest version (${update.current}).`;
+}
+
+function confirmUpdate() {
+  if (!update?.available) return;
+  sound("open");
+  openModal(`<div class="modal-head"><h2>Update 3DS?</h2></div>
+    <div class="modal-body"><p>${esc(updateText())}</p>
+      <p>Updating gets the newest 3DS app and Azahar. It takes a minute or two, then 3DS starts again by itself. Your games, saves and settings stay as they are.</p></div>
+    <div class="modal-foot"><button class="btn" data-close>Not now</button>
+      <button class="btn primary" id="do-update">${icon("download")} Update</button></div>`);
+  $("do-update").onclick = runUpdate;
+}
+
+async function runUpdate() {
+  if (playing) return showMessage("Close the game first", "Updating has to wait until you've finished playing.");
+  openModal(`<div class="modal-head"><h2>Updating...</h2></div>
+    <div class="modal-body"><div class="spinner"></div>
+      <p class="wait-text">Getting the newest version. This takes a minute or two; 3DS starts again by itself when it's done.</p></div>`, { locked: true });
+  try {
+    await invoke("update_now");
+  } catch (e) {
+    closeModal();
+    return showMessage("Couldn't update", String(e));
+  }
+  sound("done");
+  if (lib?.gaming_mode) {
+    // Steam only shows what it started, so 3DS can't reopen itself here.
+    openModal(`<div class="modal-head"><h2>Updated!</h2></div>
+      <div class="modal-body"><p>3DS closes now. Start it again from your Steam library to use the new version.</p></div>
+      <div class="modal-foot"><button class="btn primary" id="do-relaunch">OK</button></div>`, { locked: true });
+    $("do-relaunch").onclick = () => invoke("relaunch");
+  } else {
+    $("modal-body").querySelector(".wait-text").textContent = "Updated! Starting the new version...";
+    setTimeout(() => invoke("relaunch"), 900);
+  }
+}
+
 function showMessage(title, html, isHtml) {
   openModal(`<div class="modal-head"><h2>${esc(title)}</h2></div>
     <div class="modal-body">${isHtml ? html : `<p>${esc(html)}</p>`}</div>
@@ -569,14 +638,19 @@ function showMessage(title, html, isHtml) {
 
 // ---------------------------------------------------------------- modal
 
-function openModal(html, { locked = false } = {}) {
-  const wrap = $("modal");
-  $("modal-body").innerHTML = html;
+let returnFocus = null; // what had the focus before a dialog opened
+
+/** Show a dialog. focus: a selector for what to start on (else its main button, else the first). */
+function openModal(html, { locked = false, focus = null } = {}) {
+  const wrap = $("modal"), body = $("modal-body");
+  if (!modalOpen) returnFocus = document.activeElement;
+  body.innerHTML = html;
+  delete body.dataset.kind;
   wrap.hidden = false;
   wrap.dataset.locked = locked ? "1" : "";
   modalOpen = true;
-  $("modal-body").querySelectorAll("[data-close]").forEach((b) => (b.onclick = closeModal));
-  ($("modal-body").querySelector(".btn.primary:not([disabled])") || $("modal-body").querySelector("button"))?.focus();
+  body.querySelectorAll("[data-close]").forEach((b) => (b.onclick = closeModal));
+  ((focus && body.querySelector(focus)) || body.querySelector(".btn.primary:not([disabled])") || body.querySelector("button:not([disabled])"))?.focus();
 }
 
 function closeModal() {
@@ -584,6 +658,9 @@ function closeModal() {
   $("modal").hidden = true;
   modalOpen = false;
   sound("back");
+  if (returnFocus?.isConnected && returnFocus !== document.body) returnFocus.focus({ preventScroll: true });
+  else if (padUsed()) selectedTile()?.focus({ preventScroll: true });
+  returnFocus = null;
   onModalClose?.();
   onModalClose = null;
 }
@@ -592,16 +669,167 @@ $("modal").addEventListener("mousedown", (e) => {
   if (e.target === $("modal") && !$("modal").dataset.locked) closeModal();
 });
 
-// ---------------------------------------------------------------- input
+// ---------------------------------------------------------------- moving around
+// Everything works without a mouse, from the arrow keys or a controller. On the main screen the
+// D-pad moves through the games; past the grid's edge it goes on to the buttons around it (the
+// toolbar, the selected game's Play and Older saves, the status pills), and B comes back to the
+// games. In a dialog it moves between the dialog's buttons by where they are on screen.
 
-document.addEventListener("keydown", (e) => {
+const MAIN_ITEMS = '#top .pill:not([hidden]), #stage button:not([disabled]), .toolbar button, .grid button.tile';
+const MODAL_ITEMS = 'button:not([disabled]), [tabindex="0"]';
+const shown = (el) => el.getClientRects().length > 0;
+const mainItems = () => [...document.querySelectorAll(MAIN_ITEMS)].filter(shown);
+const selectedTile = () => $("grid").querySelector(".tile.selected") ?? $("grid").querySelector(".tile[data-i]");
+const padUsed = () => document.documentElement.classList.contains("pad-nav");
+
+/** The nearest of items from `from` going `dir`. sameRow keeps left/right on the same line. */
+function nearest(items, from, dir, sameRow) {
+  const box = (el) => { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2, r.height]; };
+  const [cx, cy, ch] = box(from);
+  const vertical = dir === "up" || dir === "down";
+  const sign = dir === "up" || dir === "left" ? -1 : 1;
+  const found = []; // [element, distance that way, distance sideways]
+  for (const el of items) {
+    if (el === from) continue;
+    const [x, y] = box(el);
+    const along = (vertical ? y - cy : x - cx) * sign, across = Math.abs(vertical ? x - cx : y - cy);
+    if (along < 4 || (sameRow && !vertical && across > ch)) continue;
+    found.push([el, along, across]);
+  }
+  if (!found.length) return null;
+  const least = (list, score) => list.reduce((a, b) => (score(b) < score(a) ? b : a))[0];
+  if (!vertical) return least(found, ([, along, across]) => along + across * 3);
+  // Up/down: the very next row (so no setting gets skipped), then what's closest in it.
+  const row = Math.min(...found.map((f) => f[1]));
+  return least(found.filter((f) => f[1] <= row + Math.max(ch / 2, 12)), ([, , across]) => across);
+}
+
+/** From a tile: the next tile in the grid, or past the grid's edge, the nearest button that way. */
+function gridStep(tile, dir) {
+  const tiles = [...$("grid").querySelectorAll("button.tile")];
+  const i = tiles.indexOf(tile), col = i % COLUMNS, last = tiles.length - 1;
+  let j = -1;
+  if (dir === "left" && col > 0) j = i - 1;
+  else if (dir === "right" && col < COLUMNS - 1 && i < last) j = i + 1;
+  else if (dir === "up") j = i - COLUMNS;
+  else if (dir === "down" && Math.floor(i / COLUMNS) < Math.floor(last / COLUMNS)) j = Math.min(i + COLUMNS, last);
+  if (j >= 0) return tiles[j];
+  const g = $("grid").getBoundingClientRect();
+  const beyond = (el) => { const r = el.getBoundingClientRect(); return { up: r.bottom <= g.top, down: r.top >= g.bottom, left: r.right <= g.left, right: r.left >= g.right }[dir]; };
+  const out = leave(tile, dir, mainItems().filter((el) => !el.classList.contains("tile") && beyond(el)));
+  if (out) return out;
+  // nothing beside the grid: left/right carry on to the row above/below
+  if (dir === "left" && i > 0) return tiles[i - 1];
+  if (dir === "right" && i < last) return tiles[i + 1];
+  return null;
+}
+
+/** From a button outside the grid. */
+function mainStep(cur, dir) {
+  const next = (dir === "left" || dir === "right") && nearest(mainItems(), cur, dir, true);
+  return next || leave(cur, dir, mainItems());
+}
+
+/** The best of `items` going `dir` from cur: up/down stay on the same screen while they can;
+ *  left/right go across to the other screen when the screens sit side by side (Steam Deck),
+ *  landing on Play there, or on the selected game. */
+function leave(cur, dir, items) {
+  const screen = (el) => el.closest(".screen");
+  let next;
+  if (dir === "up" || dir === "down") {
+    next = nearest(items.filter((el) => screen(el) === screen(cur)), cur, dir) ?? nearest(items, cur, dir);
+  } else {
+    const s = screen(cur).getBoundingClientRect();
+    const across = items.filter((el) => {
+      const r = screen(el).getBoundingClientRect();
+      return dir === "left" ? r.right <= s.left : r.left >= s.right;
+    });
+    const play = across.find((el) => el.id === "btn-play" || el.id === "welcome-add");
+    next = play ?? nearest(across, cur, dir);
+  }
+  // Into the grid: land on the selected game, not whichever tile happens to be closest.
+  if (next?.dataset.i !== undefined && cur.dataset.i === undefined) next = selectedTile() ?? next;
+  return next;
+}
+
+function nav(dir) {
+  document.documentElement.classList.add("pad-nav");
+  if (modalOpen) return focusStep(dir);
+  if (playing || !lib) return;
+  let cur = document.activeElement;
+  if (!mainItems().includes(cur)) {
+    cur = selectedTile() ?? $("slot-add") ?? $("welcome-add");
+    if (!cur) return;
+    cur.focus({ preventScroll: true });
+  }
+  const next = cur.classList.contains("tile") ? gridStep(cur, dir) : mainStep(cur, dir);
+  if (!next || next === cur) return;
+  next.focus({ preventScroll: true });
+  next.scrollIntoView({ block: "nearest" });
+  sound("move");
+}
+
+/** Move the focus inside a dialog to the nearest thing in that direction. */
+function focusStep(dir) {
+  const body = $("modal-body");
+  const items = [...body.querySelectorAll(MODAL_ITEMS)].filter(shown);
+  const cur = document.activeElement;
+  if (!items.includes(cur)) { items[0]?.focus(); return; }
+  // The middle scrolls under a fixed top and bottom, so on screen a button scrolled out of view
+  // can be "above" the close button. Up/down stay in their part, then go on to the next part.
+  const PARTS = [".modal-head", ".modal-body", ".modal-foot"];
+  const part = (el) => PARTS.findIndex((p) => el.closest(p));
+  let best = nearest(items.filter((el) => part(el) === part(cur)), cur, dir, true);
+  if (!best && (dir === "up" || dir === "down")) {
+    for (let i = part(cur) + (dir === "up" ? -1 : 1); i >= 0 && i < PARTS.length && !best; i += dir === "up" ? -1 : 1) {
+      best = nearest(items.filter((el) => part(el) === i), cur, dir, false);
+    }
+  }
+  if (best) { best.focus(); best.scrollIntoView({ block: "nearest" }); sound("move"); }
+}
+
+/** A / Enter: play the focused game, or press the focused button. */
+function activate() {
+  const cur = document.activeElement;
   if (modalOpen) {
-    if (e.key === "Escape" && !$("modal").dataset.locked) closeModal();
+    if ($("modal-body").contains(cur)) cur.click();
+    else focusStep("down");
     return;
   }
-  const keys = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -COLUMNS, ArrowDown: COLUMNS };
-  if (e.key in keys) { e.preventDefault(); move(keys[e.key]); }
-  else if (e.key === "Enter" && document.activeElement?.tagName !== "BUTTON") play(current());
+  if (cur?.dataset.i !== undefined && cur.classList.contains("tile")) play(lib.games[+cur.dataset.i]);
+  else if (mainItems().includes(cur)) cur.click();
+  else play(current());
+}
+
+/** B / Escape: close the dialog, or go back to the games. */
+function back() {
+  if (modalOpen) {
+    if (!$("modal").dataset.locked) closeModal();
+    return;
+  }
+  const cur = document.activeElement;
+  if (mainItems().includes(cur) && cur.dataset.i === undefined) {
+    selectedTile()?.focus({ preventScroll: true });
+    sound("back");
+  }
+}
+
+// Focusing a game (by controller, arrow keys or Tab) selects it.
+$("grid").addEventListener("focusin", (e) => {
+  const i = e.target.dataset?.i;
+  if (i !== undefined && lib?.games[+i]) select(lib.games[+i].path, padUsed()); // nav() makes the sound
+});
+document.addEventListener("focusin", () => lib && renderHints());
+
+const ARROWS = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+document.addEventListener("keydown", (e) => {
+  if (e.key in ARROWS) { e.preventDefault(); nav(ARROWS[e.key]); }
+  else if (e.key === "Escape") back();
+  else if (e.key === "Enter") {
+    // Enter presses a focused button by itself; games (play) and the status pill need a hand.
+    const t = document.activeElement;
+    if (!modalOpen && (t?.tagName !== "BUTTON" || t.dataset.i !== undefined)) { e.preventDefault(); activate(); }
+  }
 });
 
 // Controllers come from the app (native, see pad.rs) as "pad" events, by button position:
@@ -617,46 +845,25 @@ listen("pad", ({ payload: { button, down } }) => {
   document.documentElement.classList.add("pad-nav");
   if (dir) {
     clearTimeout(padTimer);
-    const step = () => (modalOpen ? focusStep(button) : move({ left: -1, right: 1, up: -COLUMNS, down: COLUMNS }[button]));
-    step();
-    const again = (ms) => (padTimer = setTimeout(() => { step(); again(130); }, ms));
+    nav(button);
+    const again = (ms) => (padTimer = setTimeout(() => { nav(button); again(130); }, ms));
     again(380);
     return;
   }
+  if (button === "a") return activate();
+  if (button === "b") return back();
   if (modalOpen) {
-    if (button === "a") document.activeElement?.click();
-    if (button === "b" && !$("modal").dataset.locked) closeModal();
+    // Start again closes Settings
+    if (button === "start" && $("modal-body").dataset.kind === "settings") closeModal();
     return;
   }
   const g = current();
-  if (button === "a") play(g);
-  else if (button === "y" && g?.title_id) showVersions(g, false);
+  if (button === "y" && g?.title_id) showVersions(g, false);
   else if (button === "x" && lib) showSavesList();
   else if (button === "start" && lib) showSettings();
 });
-// the focus ring is for controller use; the mouse doesn't need it
+// the focus ring is for controller and keyboard use; the mouse doesn't need it
 document.addEventListener("pointerdown", () => document.documentElement.classList.remove("pad-nav"));
-
-/** Move the focus inside a dialog to the nearest thing in that direction. */
-function focusStep(dir) {
-  const items = [...$("modal-body").querySelectorAll('button:not([disabled]), [tabindex="0"]')].filter((el) => el.offsetParent);
-  const cur = document.activeElement;
-  if (!items.includes(cur)) { items[0]?.focus(); return; }
-  const center = (el) => { const r = el.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2, r.height]; };
-  const [cx, cy, ch] = center(cur);
-  const vertical = dir === "up" || dir === "down";
-  const sign = dir === "up" || dir === "left" ? -1 : 1;
-  let best = null, bestScore = Infinity;
-  for (const el of items) {
-    if (el === cur) continue;
-    const [x, y] = center(el);
-    const along = (vertical ? y - cy : x - cx) * sign, across = Math.abs(vertical ? x - cx : y - cy);
-    if (along < 4 || (!vertical && across > ch)) continue;  // left/right stays on the same row
-    const score = along + across * 3;
-    if (score < bestScore) { best = el; bestScore = score; }
-  }
-  if (best) { best.focus(); best.scrollIntoView({ block: "nearest" }); sound("move"); }
-}
 
 // ---------------------------------------------------------------- wiring
 
@@ -665,6 +872,7 @@ $("btn-folder").onclick = () => invoke("open_folder", { which: "games" });
 $("btn-settings").onclick = () => lib && showSettings();
 $("btn-saves").onclick = () => lib && showSavesList();
 $("backup-pill").onclick = () => lib && showSettings();
+$("update-pill").onclick = confirmUpdate;
 
 listen("copy-progress", ({ payload }) => {
   const name = $("copy-name"), bar = $("copy-bar");
@@ -708,3 +916,4 @@ setInterval(() => !modalOpen && !document.hidden && refresh(), 60_000);
 
 $("stage").innerHTML = `<div class="center-card"><div class="spinner"></div></div>`;
 refresh();
+checkUpdate();

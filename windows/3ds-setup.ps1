@@ -2,6 +2,7 @@
 3ds-setup (Windows): install Azahar (3DS emulator) and keep your saves backed up.
 
   install    download/update Azahar, pick a backup folder, start the background watcher
+  update     install again with no questions (what the 3DS app's Update button runs)
   watch      background loop: while Azahar runs, back up saves and auto save-state
   backup     back up right now
   restore    pick a backup to bring back (or: restore <number> -Game <ID>)
@@ -557,9 +558,10 @@ function Get-ControllerProfile {
 }
 
 # Azahar settings we start people on. Only ones still at Azahar's own default are changed, so
-# anything set by hand stays. Same as AZAHAR_DEFAULTS in 3ds-setup.py.
+# anything set by hand stays, and each is offered only once (see Set-AzaharConfig). Same as
+# AZAHAR_DEFAULTS in 3ds-setup.py.
 $AzaharDefaults = [ordered]@{
-    Renderer = [ordered]@{ resolution_factor = '3' }  # 3x native
+    Renderer = [ordered]@{ resolution_factor = '3'; turbo_limit = '150' }  # 3x the 3DS's resolution; speed-up at 1.5x
     # One key each for actions that have no controller button, for controller remappers.
     UI = [ordered]@{
         'Shortcuts\Main%20Window\Toggle%20Turbo%20Mode\KeySeq' = 'Tab'  # speed up on/off
@@ -574,6 +576,7 @@ function Set-AzaharConfig($cfg, [bool]$useController) {
     $ini = Join-Path (Get-AzaharUserDir) 'config\qt-config.ini'
     $lines = New-Object 'System.Collections.Generic.List[string]'
     if (Test-Path -LiteralPath $ini) { foreach ($l in [IO.File]::ReadAllLines($ini)) { $lines.Add($l) } }
+    $azaharUsed = $lines.Count -gt 0
     $changed = $false
 
     $games = $cfg.games_dir.Replace('\', '/')
@@ -596,15 +599,25 @@ function Set-AzaharConfig($cfg, [bool]$useController) {
         Set-IniValues $lines 'UI' $items
         $changed = $true
     }
+    # Each default is offered once; after that the setting is yours. (Azahar flags a value as its
+    # default whenever it equals its own, so a 2x speed-up picked later would look untouched.)
+    if ($cfg.Contains('azahar_defaults_applied')) { $applied = @($cfg.azahar_defaults_applied) }
+    else {
+        # Setups before v1.6.0 offered all but the speed-up already.
+        $applied = @(if ($azaharUsed) { foreach ($section in $AzaharDefaults.Keys) { foreach ($key in $AzaharDefaults[$section].Keys) { if ($key -ne 'turbo_limit') { "$section/$key" } } } })
+    }
     foreach ($section in $AzaharDefaults.Keys) {
         $items = [ordered]@{}
         foreach ($key in $AzaharDefaults[$section].Keys) {
+            if ($applied -contains "$section/$key") { continue }
+            $applied += "$section/$key"
             $want = $AzaharDefaults[$section][$key]
             $current = Get-IniValue $lines $section $key
             if (($null -eq $current -or (Get-IniValue $lines $section "$key\default") -eq 'true') -and $current -ne $want) { $items[$key] = $want }
         }
         if ($items.Count) { Set-IniValues $lines $section $items; $changed = $true }
     }
+    $cfg.azahar_defaults_applied = $applied
     # Never replace a mapping someone already set up.
     if ($useController -and $null -eq (Get-IniValue $lines 'Controls' 'profiles\size')) {
         Set-IniValues $lines 'Controls' (Get-ControllerProfile)
@@ -791,13 +804,23 @@ function Install-Launcher {
             return $false
         }
         Install-WebView2
-        Stop-Launcher
+        Remove-Item -LiteralPath "$LauncherExe.old" -Force -ErrorAction SilentlyContinue
+        if ($Command -eq 'update' -and (Test-Path -LiteralPath $LauncherExe)) {
+            # The app that asked for the update is still open, and Windows won't overwrite a
+            # program that's running, but it will rename it. The app restarts itself afterwards.
+            Move-Item -LiteralPath $LauncherExe -Destination "$LauncherExe.old" -Force
+        } else {
+            Stop-Launcher
+        }
         Copy-Item -LiteralPath $src -Destination $LauncherExe -Force
         Unblock-File -LiteralPath $LauncherExe
         if (-not $env:THREEDS_LAUNCHER) { Remove-Item -LiteralPath $src -Force }
         return $true
     } catch {
         Log "couldn't set up the 3DS app: $_"
+        if (-not (Test-Path -LiteralPath $LauncherExe) -and (Test-Path -LiteralPath "$LauncherExe.old")) {
+            Move-Item -LiteralPath "$LauncherExe.old" -Destination $LauncherExe -Force  # put the running one back
+        }
         return $false
     }
 }
@@ -872,9 +895,11 @@ function Invoke-Install {
 
     New-Item -ItemType Directory -Force -Path $cfg.games_dir | Out-Null
     if (Test-AzaharRunning) { Write-Host '(Azahar is open, so its settings were left alone. Run Update Azahar after closing it.)' }
-    else { Set-AzaharConfig $cfg ([bool]$cfg.controller) }
+    else { Set-AzaharConfig $cfg ([bool]$cfg.controller); Save-Config $cfg }  # saves which defaults were offered
 
     $launcherOk = Install-Launcher
+    # The 3DS app asked for this, so leave it as it was and say so.
+    if ($Command -eq 'update' -and -not $launcherOk) { throw "Couldn't update the 3DS app. Check that you're online, then try again." }
 
     $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $run = "-NoProfile -ExecutionPolicy Bypass -File `"$me`""
@@ -968,12 +993,13 @@ function Show-Status {
 try {
     switch ($Command) {
         'install'   { Invoke-Install }
+        'update'    { $Quiet = $true; Invoke-Install }  # the 3DS app's Update button: no questions or dialogs
         'watch'     { Invoke-Watch }
         'backup'    { Invoke-Backup }
         'restore'   { Invoke-Restore }
         'status'    { Show-Status }
         'uninstall' { Invoke-Uninstall }
-        default     { Write-Host 'usage: 3ds-setup.ps1 install|watch|backup|restore|status|uninstall' }
+        default     { Write-Host 'usage: 3ds-setup.ps1 install|update|watch|backup|restore|status|uninstall' }
     }
 } catch {
     Log "ERROR in ${Command}: $_"
@@ -982,3 +1008,4 @@ try {
     exit 1
 }
 if ($Pause -and -not $Quiet) { Read-Host 'Press Enter to close' | Out-Null }
+# end of 3ds-setup (the 3DS app checks for this line to know an update downloaded in full)

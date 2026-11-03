@@ -140,6 +140,17 @@ jobs:
           $p | Stop-Process -Force
           Write-Host 'ok: 3DS app runs'
 
+      - name: Update while the 3DS app is open (what its Update button runs)
+        run: |
+          $p = Start-Process "$env:LOCALAPPDATA\3ds-setup\3DS.exe" -PassThru
+          Start-Sleep 8
+          windows\3ds-setup.ps1 update
+          if ($LASTEXITCODE) { exit 1 }
+          if ($p.HasExited) { throw 'the update closed the open app' }
+          if (-not (Test-Path "$env:LOCALAPPDATA\3ds-setup\3DS.exe")) { throw '3DS.exe missing after the update' }
+          $p | Stop-Process -Force
+          Write-Host 'ok: updated with the app open'
+
       - name: Watcher notices Azahar
         continue-on-error: true  # Azahar may not start on a GPU-less runner
         run: |
@@ -243,6 +254,14 @@ jobs:
             [ $code -eq 124 ] || { echo "the 3DS app quit early (exit $code)"; exit 1; }
           fi
           echo "ok: 3DS app runs"
+
+      - name: Update (what the 3DS app's Update button runs)
+        run: |
+          set -e
+          ~/.local/bin/3ds-setup update
+          if [ "$(uname)" = Darwin ]; then test -n "$(ls "$HOME/Applications/3DS.app/Contents/MacOS/")"; else test -x "$HOME/.local/share/3ds-setup/3ds-launcher"; fi
+          grep -q 'turbo_limit=150' "$([ "$(uname)" = Darwin ] && echo "$HOME/Library/Application Support/Azahar/config" || echo "$HOME/.config/azahar-emu")/qt-config.ini"
+          echo "ok: updated"
 
       - name: Watcher notices Azahar (macOS)
         if: runner.os == 'macOS'

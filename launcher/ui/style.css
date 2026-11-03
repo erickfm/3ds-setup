@@ -105,7 +105,9 @@ html, body {
 }
 
 button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; padding: 0; }
-button:focus-visible, .pad-nav .modal :focus { outline: 3px solid var(--cyan); outline-offset: 2px; }
+/* Where the controller / arrow keys are. Games show it with their selected glow instead. */
+button:focus-visible, .pad-nav .modal :focus, .pad-nav .console :focus { outline: 3px solid var(--cyan); outline-offset: 2px; }
+.tile[data-i]:focus, .tile[data-i]:focus-visible { outline: none; }
 svg { width: 1em; height: 1em; flex: none; }
 
 .console {
@@ -194,7 +196,10 @@ svg { width: 1em; height: 1em; flex: none; }
 .pill.warn .dot { background: var(--amber); box-shadow: 0 0 0 calc(var(--u) * .35) rgba(240, 160, 32, .22); }
 .pill.bad { background: var(--red-soft); color: var(--red-ink); }
 .pill.bad .dot { background: var(--red); box-shadow: 0 0 0 calc(var(--u) * .35) rgba(229, 72, 77, .2); }
-.pill[role="button"] { cursor: pointer; }
+.pill[tabindex], button.pill { cursor: pointer; }
+.pill[hidden] { display: none; }
+.pill.update { font-weight: inherit; background: var(--cyan-soft); color: var(--cyan-ink); }
+.pill.update svg { font-size: calc(var(--u) * 2.1); }
 
 .stage {
   flex: 1;
@@ -411,7 +416,9 @@ svg { width: 1em; height: 1em; flex: none; }
   background: var(--ghost-2);
   box-shadow: inset 0 0 0 calc(var(--u) * .3) var(--edge);
 }
-.tile.ghost.add-slot:hover { color: var(--cyan-deep); box-shadow: inset 0 0 0 calc(var(--u) * .3) var(--cyan); }
+.tile.ghost.add-slot:hover, .tile.ghost.add-slot:focus { color: var(--cyan-deep); box-shadow: inset 0 0 0 calc(var(--u) * .3) var(--cyan); }
+/* the controller is on a button outside the grid: the selected game stays marked, but stops pulsing */
+.pad-nav .grid:not(:focus-within) .tile.selected { animation: none; }
 
 /* a stand-in icon for games without one */
 .art.letter {
@@ -571,6 +578,7 @@ img.art { display: block; object-fit: cover; }
 
 .progress { height: calc(var(--u) * 1.6); border-radius: 99px; background: var(--well-2); overflow: hidden; margin: calc(var(--u) * 1) 0; }
 .progress > div { height: 100%; width: 0; border-radius: 99px; background: linear-gradient(90deg, var(--cyan), var(--cyan-deep)); transition: width .2s; }
+.wait-text { text-align: center; }
 .spinner { width: calc(var(--u) * 4); height: calc(var(--u) * 4); margin: calc(var(--u) * 2) auto; border-radius: 50%; border: calc(var(--u) * .6) solid var(--cyan-soft); border-top-color: var(--cyan); animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

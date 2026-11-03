@@ -211,11 +211,31 @@ fn backup_saves_dirs(p: &Paths, cfg: &Config) -> (Vec<PathBuf>, bool) {
 
 // ---------------------------------------------------------------- the 3ds-setup script
 
+#[cfg(windows)]
+fn powershell() -> Command {
+    let root = env_path("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let mut cmd = command(root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+/// Keep a child going after we quit (its own session, so it isn't in our process group).
+#[cfg(unix)]
+fn detach(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
 fn script_command(p: &Paths, args: &[&str]) -> Command {
     #[cfg(windows)]
     {
-        let root = env_path("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        let mut cmd = command(root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+        let mut cmd = powershell();
         cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
         cmd.arg(p.install_dir.join("3ds-setup.ps1"));
         // PowerShell spells options -Game / -Quiet
@@ -224,7 +244,6 @@ fn script_command(p: &Paths, args: &[&str]) -> Command {
             "--quiet" => "-Quiet",
             a => a,
         }));
-        cmd.creation_flags(CREATE_NO_WINDOW);
         cmd
     }
     #[cfg(not(windows))]
@@ -278,16 +297,7 @@ fn ensure_watcher(p: &Paths) {
     let mut cmd = script_command(p, &["watch"]);
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid is async-signal-safe; it detaches the watcher from our process group.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    detach(&mut cmd);
     let _ = cmd.spawn();
 }
 
@@ -328,6 +338,7 @@ struct Library {
     azahar_ready: bool,
     playing: Option<String>,
     handheld: bool,
+    gaming_mode: bool,
 }
 
 fn ms(t: SystemTime) -> u64 {
@@ -528,6 +539,7 @@ fn scan(p: &Paths, playing: Option<String>) -> Library {
         azahar_ready: p.azahar.exists(),
         playing,
         handheld: handheld(),
+        gaming_mode: gaming_mode(),
     }
 }
 
@@ -971,6 +983,202 @@ fn set_emu_setting(app: AppHandle, playing: State<'_, Playing>, name: String, va
     std::fs::rename(&tmp, &p.azahar_ini).map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------- updates
+// The installed setup script knows which release it came from (build-release.py writes the tag
+// into it), and a release's script installs that release's 3DS app. So updating is: fetch the
+// newest script, run its "update" (an install with no questions), then restart the app.
+
+const RELEASES: &str = "https://github.com/erickfm/3ds-setup/releases";
+
+fn setup_script(p: &Paths) -> PathBuf {
+    p.install_dir.join(if cfg!(windows) { "3ds-setup.ps1" } else { "3ds-setup.py" })
+}
+
+/// The release tag in a setup script: RELEASE_TAG = "v1.2.3" or $ReleaseTag = 'v1.2.3'.
+/// None for a script that isn't from a release (a checkout or a local build).
+fn script_release(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("RELEASE_TAG = ").or_else(|| l.strip_prefix("$ReleaseTag = ")))
+        .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// v1.10.0 -> [1, 10, 0]
+fn version_parts(tag: &str) -> Option<Vec<u64>> {
+    tag.trim_start_matches('v').split('.').map(|n| n.parse().ok()).collect()
+}
+
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (version_parts(latest), version_parts(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+/// The newest release's tag: github.com/.../releases/latest redirects to .../releases/tag/<tag>.
+/// (Not the GitHub API, which allows only 60 requests an hour per address.)
+fn latest_release() -> Option<String> {
+    let resp = ureq::head(&format!("{RELEASES}/latest"))
+        .set("User-Agent", "3ds-setup")
+        .timeout(Duration::from_secs(15))
+        .call()
+        .ok()?;
+    let tag = resp.get_url().rsplit_once("/tag/")?.1.trim_end_matches('/').to_string();
+    version_parts(&tag).map(|_| tag)
+}
+
+#[derive(Serialize)]
+struct UpdateInfo {
+    current: Option<String>,
+    latest: Option<String>,
+    available: bool,
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
+    blocking(move || {
+        let p = paths(&app);
+        let current = std::fs::read_to_string(setup_script(&p)).ok().and_then(|t| script_release(&t));
+        let latest = latest_release();
+        // Without a release tag (a test build), any release counts as newer.
+        let available = latest.as_deref().is_some_and(|l| current.as_deref().is_none_or(|c| is_newer(l, c)));
+        UpdateInfo { current, latest, available }
+    })
+    .await
+}
+
+fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let resp = ureq::get(url)
+        .set("User-Agent", "3ds-setup")
+        .timeout(Duration::from_secs(60))
+        .call()
+        .map_err(|e| format!("Couldn't download the update. Are you online? ({e})"))?;
+    let mut body = Vec::new();
+    resp.into_reader().take(limit + 1).read_to_end(&mut body).map_err(|e| e.to_string())?;
+    if body.len() as u64 > limit {
+        return Err("The update download was too big. Try again later.".into());
+    }
+    Ok(body)
+}
+
+/// The last line of every setup script, so a download that was cut short can be told apart.
+const SCRIPT_END: &str = "# end of 3ds-setup";
+
+/// A whole setup script from a release, with the update command (not an error page or a
+/// download that was cut short).
+fn complete_script(text: &str) -> bool {
+    let last = text.trim_end().lines().last().unwrap_or("");
+    last.starts_with(SCRIPT_END) && (text.contains("\"update\"") || text.contains("'update'")) && script_release(text).is_some()
+}
+
+/// Put the newest release's setup script where the installed one is.
+fn fetch_setup_script(p: &Paths) -> Result<(), String> {
+    let bytes = if cfg!(windows) {
+        // Windows gets one .bat with the PowerShell script after a marker (see build-release.py).
+        let bat = download(&format!("{RELEASES}/latest/download/3DS-Setup-Windows.bat"), 4 << 20)?;
+        let text = String::from_utf8_lossy(&bat);
+        let at = text.rfind("###PS1###").ok_or("The update download was damaged. Try again later.")?;
+        let ps1 = text[at + "###PS1###".len()..].trim_start();
+        // PowerShell 5.1 reads a script without a byte order mark as the local code page.
+        [&[0xEF, 0xBB, 0xBF][..], ps1.as_bytes()].concat()
+    } else {
+        download(&format!("{RELEASES}/latest/download/3ds-setup.py"), 4 << 20)?
+    };
+    if !complete_script(&String::from_utf8_lossy(&bytes)) {
+        return Err("The update download was damaged. Try again later.".into());
+    }
+    let dest = setup_script(p);
+    let tmp = dest.with_extension("partial");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    }
+    std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())
+}
+
+/// Download and install the newest release: the 3DS app, Azahar, and the backup watcher.
+/// The app keeps running (its file is swapped underneath it); call relaunch afterwards.
+#[tauri::command]
+async fn update_now(app: AppHandle, playing: State<'_, Playing>) -> Result<(), String> {
+    if playing.0.lock().unwrap().is_some() {
+        return Err("Please close the game first, then try again.".into());
+    }
+    blocking(move || {
+        let p = paths(&app);
+        // Keep the installed script until the update works: it's what backups run, and its
+        // release tag is the version check_update reports as installed.
+        let script = setup_script(&p);
+        let kept = script.with_extension("previous");
+        std::fs::copy(&script, &kept).map_err(|e| e.to_string())?;
+        let restore = || {
+            let _ = std::fs::rename(&kept, &script);
+        };
+        if let Err(e) = fetch_setup_script(&p) {
+            restore();
+            return Err(e);
+        }
+        // Output goes to a file, not a pipe: the watcher that setup restarts would otherwise hold
+        // the pipe open and this would wait for it forever.
+        let log = p.install_dir.join("update.log");
+        let out = std::fs::File::create(&log).map_err(|e| e.to_string())?;
+        let err = out.try_clone().map_err(|e| e.to_string())?;
+        let status = script_command(&p, &["--quiet", "update"])
+            .stdin(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            .status()
+            .map_err(|e| format!("couldn't run 3ds-setup: {e}"))?;
+        if status.success() {
+            let _ = std::fs::remove_file(&kept);
+            return Ok(());
+        }
+        restore();
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("unknown error").trim();
+        Err(format!("{last}\n\nDetails are in {}", log.display()))
+    })
+    .await?
+}
+
+/// Close, and (outside Steam's Gaming Mode) start again once this copy has quit, so the new
+/// version opens. In Gaming Mode Steam only shows what it started, so you start 3DS again there.
+#[tauri::command]
+fn relaunch(app: AppHandle) {
+    if !gaming_mode() {
+        let p = paths(&app);
+        let pid = std::process::id().to_string();
+        #[cfg(windows)]
+        {
+            let exe = p.install_dir.join("3DS.exe").to_string_lossy().replace('\'', "''");
+            let _ = powershell()
+                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command"])
+                .arg(format!("Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Process -FilePath '{exe}'"))
+                .spawn();
+        }
+        #[cfg(unix)]
+        {
+            let (opener, target) = if cfg!(target_os = "macos") {
+                ("open", p.home.join("Applications/3DS.app"))
+            } else {
+                ("", p.install_dir.join("3ds-launcher"))
+            };
+            let mut cmd = command("sh");
+            cmd.args(["-c", r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; sleep 0.3; if [ -n "$3" ]; then exec "$3" "$2"; else exec "$2"; fi"#, "sh", &pid])
+                .arg(target)
+                .arg(opener)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            detach(&mut cmd);
+            let _ = cmd.spawn();
+        }
+    }
+    app.exit(0);
+}
+
 /// Point backups at a new folder (a "3DS-Backups" folder inside the one picked), bringing
 /// along this computer's existing backups. Nothing is deleted from the old folder.
 #[tauri::command]
@@ -1053,8 +1261,44 @@ fn main() {
             set_fullscreen,
             emu_settings,
             set_emu_setting,
-            set_backup_dir
+            set_backup_dir,
+            check_update,
+            update_now,
+            relaunch
         ])
         .run(tauri::generate_context!())
         .expect("error while running the 3DS launcher");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_tag_in_scripts() {
+        assert_eq!(script_release("x = 1\nRELEASE_TAG = \"v1.6.0\"\n").as_deref(), Some("v1.6.0"));
+        assert_eq!(script_release("$ReleaseTag = 'v1.6.0'\r\n").as_deref(), Some("v1.6.0"));
+        assert_eq!(script_release("RELEASE_TAG = \"\"\n"), None);
+        assert_eq!(script_release("$ReleaseTag = ''"), None);
+    }
+
+    #[test]
+    fn whole_scripts_only() {
+        let py = std::fs::read_to_string("../mac-linux/3ds-setup.py").unwrap().replace("RELEASE_TAG = \"\"", "RELEASE_TAG = \"v1.6.0\"");
+        let ps = std::fs::read_to_string("../windows/3ds-setup.ps1").unwrap().replace("$ReleaseTag = ''", "$ReleaseTag = 'v1.6.0'");
+        for text in [py, ps] {
+            assert!(complete_script(&text));
+            assert!(!complete_script(&text[..text.len() * 2 / 3]));
+        }
+        assert!(!complete_script("<html>Not Found</html>"));
+    }
+
+    #[test]
+    fn newer_versions() {
+        assert!(is_newer("v1.6.0", "v1.5.0"));
+        assert!(is_newer("v1.10.0", "v1.9.2"));
+        assert!(!is_newer("v1.5.0", "v1.5.0"));
+        assert!(!is_newer("v1.4.0", "v1.5.0"));
+        assert!(!is_newer("nightly", "v1.5.0"));
+    }
 }

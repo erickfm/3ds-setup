@@ -162,7 +162,10 @@ def fetch(url, timeout=60):
     ctx = None
     if IS_MAC and Path("/etc/ssl/cert.pem").exists():
         ctx = ssl.create_default_context(cafile="/etc/ssl/cert.pem")
-    req = urllib.request.Request(url, headers={"User-Agent": APP})
+    headers = {"User-Agent": APP}
+    if url.startswith("https://api.github.com/") and os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"  # CI: avoid the shared rate limit
+    req = urllib.request.Request(url, headers=headers)
     return urllib.request.urlopen(req, timeout=timeout, context=ctx)
 
 

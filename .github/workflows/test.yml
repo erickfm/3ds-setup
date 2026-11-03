@@ -10,6 +10,7 @@ on:
 
 env:
   CI: "true"  # makes the scripts skip every dialog
+  GITHUB_TOKEN: ${{ github.token }}  # the Mac/Linux script uses it for GitHub API calls, so shared runners don't hit the rate limit
 
 jobs:
   launcher:
@@ -316,7 +317,9 @@ jobs:
           path: ${{ runner.temp }}/launcher
       - name: Make it look like a Steam Deck
         run: |
-          pacman -Syu --noconfirm --needed python xorg-server-xvfb
+          # what SteamOS has but a bare Arch image doesn't (AppImages expect these from the system)
+          pacman -Syu --noconfirm --needed python xorg-server-xvfb diffutils fontconfig freetype2 harfbuzz \
+            fribidi wayland libglvnd mesa libdrm libx11 libxcb libxext libxrender libxi alsa-lib ttf-dejavu
           printf 'NAME="SteamOS"\nID=steamos\nID_LIKE=arch\n' > /etc/os-release
           mkdir -p "$HOME/.local/share/Steam/userdata/12345/config"
           if pacman -Q webkit2gtk-4.1 2>/dev/null; then echo "WebKitGTK is installed; test is meaningless"; exit 1; fi
